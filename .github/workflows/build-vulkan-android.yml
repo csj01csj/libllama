@@ -36,10 +36,13 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Export NDK env vars
+      - name: Export NDK env vars and add glslc to PATH
         run: |
-          echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK=$NDK_PATH" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+          # NDK r25+ bundles glslc — add to PATH so sub-builds (vulkan-shaders-gen) find it
+          echo "$NDK_PATH/shader-tools/linux-x86_64" >> $GITHUB_PATH
 
       # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
       - name: Clone llamatik v0.14.0 (shallow)
@@ -115,35 +118,11 @@ jobs:
 
           echo "llama.cpp HEAD: $(git -C llama_cpp_src rev-parse HEAD 2>/dev/null || echo unknown)"
 
-      # ── 6. Resolve glslc ──────────────────────────────────────────────────────
-      - name: Locate glslc
-        id: glslc
+      # ── 6. Verify glslc is on PATH ────────────────────────────────────────────
+      - name: Verify glslc
         run: |
-          # Priority 1: NDK r25+ bundles glslc
-          NDK_GLSLC="${{ steps.setup-ndk.outputs.ndk-path }}/shader-tools/linux-x86_64/glslc"
-          echo "Checking NDK glslc path: $NDK_GLSLC"
-          ls -la "$(dirname $NDK_GLSLC)" 2>/dev/null || true
-
-          if [ -f "$NDK_GLSLC" ]; then
-            GLSLC="$NDK_GLSLC"
-            echo "Using NDK glslc"
-          elif command -v glslc &>/dev/null; then
-            GLSLC="$(which glslc)"
-            echo "Using system glslc"
-          else
-            # Fallback: download prebuilt glslc from Google shaderc releases
-            echo "glslc not found, downloading from shaderc releases..."
-            SHADERC_URL="https://storage.googleapis.com/shaderc/artifacts/prod/graphics_shader_compiler/shaderc/linux/continuous_clang_release/latest/install.tgz"
-            wget -q "$SHADERC_URL" -O shaderc.tgz
-            tar -xzf shaderc.tgz
-            GLSLC="$(find . -name glslc -type f | head -1)"
-            chmod +x "$GLSLC"
-            GLSLC="$(realpath $GLSLC)"
-            echo "Downloaded glslc: $GLSLC"
-          fi
-
-          "$GLSLC" --version
-          echo "glslc=$GLSLC" >> $GITHUB_OUTPUT
+          which glslc
+          glslc --version
 
       # ── 7. CMake configure + build ────────────────────────────────────────────
       - name: Configure CMake
@@ -159,8 +138,7 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
             -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DVulkan_GLSLC_EXECUTABLE="${{ steps.glslc.outputs.glslc }}"
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build libggml-vulkan.so
         run: |
