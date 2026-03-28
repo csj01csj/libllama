@@ -43,21 +43,25 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
           echo "$NDK_PATH/shader-tools/linux-x86_64" >> $GITHUB_PATH
 
-      # NDK r27c has vulkan_core.h v275 but ggml-vulkan.cpp needs v313+.
-      # Vulkan-Headers  = C  headers (vulkan_core.h, vulkan.h, ...)
-      # Vulkan-Hpp      = C++ wrapper (vulkan.hpp) — separate KhronosGroup repo
-      # Both must be injected so clang finds them before the NDK sysroot.
-      - name: Clone Vulkan-Headers and Vulkan-Hpp
+      # Install LunarG Vulkan SDK 1.3.296 — this is the version that was
+      # current when llama.cpp b4500 was written (Jan 2025).  It ships
+      # vulkan.hpp with ArrayProxy constructors that ggml-vulkan.cpp relies on.
+      # Newer SDK versions removed those constructors, breaking the build.
+      - name: Install LunarG Vulkan SDK 1.3.296
         run: |
           set -euo pipefail
-          git clone --depth=1 \
-            https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
-          git clone --depth=1 \
-            https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vulkan-hpp
-          echo "=== Vulkan-Headers version ==="
-          grep "define VK_HEADER_VERSION " /tmp/vulkan-headers/include/vulkan/vulkan_core.h | grep -v COMPLETE
-          echo "=== vulkan.hpp location in Vulkan-Hpp ==="
-          find /tmp/vulkan-hpp -name "vulkan.hpp" | head -5
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-jammy.list \
+            https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-jammy.list
+          sudo apt-get update -qq
+          sudo apt-get install -y vulkan-sdk
+          echo "=== LunarG 1.3.296 installed ==="
+          grep "define VK_HEADER_VERSION " /usr/include/vulkan/vulkan_core.h | grep -v COMPLETE
+          echo "=== vulkan.hpp present? ==="
+          ls /usr/include/vulkan/vulkan.hpp 2>/dev/null && echo "YES" || echo "NO — will clone Vulkan-Hpp"
+          echo "=== vk_video present? ==="
+          ls /usr/include/vk_video/ 2>/dev/null | head -5 || echo "NO"
 
       # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
       - name: Clone llamatik v0.14.0 (shallow)
@@ -133,31 +137,39 @@ jobs:
 
           echo "llama.cpp HEAD: $(git -C llama_cpp_src rev-parse HEAD 2>/dev/null || echo unknown)"
 
-          # Inject Vulkan headers into the path clang already searches.
-          # Compile command has: -I.../llama_cpp_src/ggml/src/../include
-          #   = -I.../llama_cpp_src/ggml/include
-          # So vulkan/ must go into ggml/include/vulkan/.
+          # Inject LunarG 1.3.296 headers (C + C++ + vk_video, all version-matched)
+          # Compile command: -I.../llama_cpp_src/ggml/src/../include = ggml/include
           mkdir -p llama_cpp_src/ggml/include/vulkan
-          # 1) C headers from Vulkan-Headers (vulkan/ and vk_video/ siblings)
-          cp -r /tmp/vulkan-headers/include/vulkan/. llama_cpp_src/ggml/include/vulkan/
-          # vk_video/ is included by vulkan_core.h via relative path → must sit
-          # under the same -I root (ggml/include/) so clang resolves it correctly
-          cp -r /tmp/vulkan-headers/include/vk_video llama_cpp_src/ggml/include/
-          # 2) C++ wrapper from Vulkan-Hpp (separate repo)
-          HPP=$(find /tmp/vulkan-hpp -name "vulkan.hpp" | head -1)
-          if [ -n "$HPP" ]; then
-            cp "$HPP" llama_cpp_src/ggml/include/vulkan/vulkan.hpp
-            echo "Copied vulkan.hpp from: $HPP"
-          else
-            echo "ERROR: vulkan.hpp not found in Vulkan-Hpp repo"
-            exit 1
+          cp -r /usr/include/vulkan/. llama_cpp_src/ggml/include/vulkan/
+          [ -d /usr/include/vk_video ] && \
+            cp -r /usr/include/vk_video llama_cpp_src/ggml/include/ || true
+
+          # If LunarG pkg didn't ship vulkan.hpp, fall back to Vulkan-Hpp v1.3.296
+          if [ ! -f llama_cpp_src/ggml/include/vulkan/vulkan.hpp ]; then
+            echo "vulkan.hpp missing from LunarG pkg — cloning Vulkan-Hpp v1.3.296"
+            git clone --depth=1 --branch v1.3.296 \
+              https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vulkan-hpp 2>/dev/null || \
+            git clone --depth=1 \
+              https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vulkan-hpp
+            HPP=$(find /tmp/vulkan-hpp -name "vulkan.hpp" | head -1)
+            [ -n "$HPP" ] && cp "$HPP" llama_cpp_src/ggml/include/vulkan/ \
+              || { echo "ERROR: vulkan.hpp not found"; exit 1; }
           fi
+
+          # If vk_video still missing, clone Vulkan-Headers for it
+          if [ ! -d llama_cpp_src/ggml/include/vk_video ]; then
+            echo "vk_video/ missing — cloning Vulkan-Headers for it"
+            git clone --depth=1 \
+              https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+            cp -r /tmp/vulkan-headers/include/vk_video llama_cpp_src/ggml/include/
+          fi
+
           echo "=== Injected headers ==="
           ls llama_cpp_src/ggml/include/vulkan/ | head -20
-          ls llama_cpp_src/ggml/include/vk_video/ | head -10
+          ls llama_cpp_src/ggml/include/vk_video/ | head -5
           grep "define VK_HEADER_VERSION " llama_cpp_src/ggml/include/vulkan/vulkan_core.h | grep -v COMPLETE
           test -f llama_cpp_src/ggml/include/vulkan/vulkan.hpp || { echo "ERROR: vulkan.hpp missing"; exit 1; }
-          test -d llama_cpp_src/ggml/include/vk_video || { echo "ERROR: vk_video/ missing"; exit 1; }
+          test -d llama_cpp_src/ggml/include/vk_video       || { echo "ERROR: vk_video/ missing"; exit 1; }
 
       # ── 6. Verify glslc is on PATH ────────────────────────────────────────────
       - name: Verify glslc
