@@ -43,14 +43,21 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
           echo "$NDK_PATH/shader-tools/linux-x86_64" >> $GITHUB_PATH
 
-      # NDK r27c has vulkan_core.h v275 but ggml-vulkan.cpp needs v313.
-      # Clone Vulkan-Headers v1.3.313 to /tmp and inject via CXXFLAGS.
-      # -I takes priority over --sysroot so clang finds v313 headers first.
-      - name: Clone Vulkan-Headers (latest)
+      # NDK r27c has vulkan_core.h v275 but ggml-vulkan.cpp needs v313+.
+      # Vulkan-Headers  = C  headers (vulkan_core.h, vulkan.h, ...)
+      # Vulkan-Hpp      = C++ wrapper (vulkan.hpp) — separate KhronosGroup repo
+      # Both must be injected so clang finds them before the NDK sysroot.
+      - name: Clone Vulkan-Headers and Vulkan-Hpp
         run: |
+          set -euo pipefail
           git clone --depth=1 \
             https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          git clone --depth=1 \
+            https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vulkan-hpp
+          echo "=== Vulkan-Headers version ==="
           grep "define VK_HEADER_VERSION " /tmp/vulkan-headers/include/vulkan/vulkan_core.h | grep -v COMPLETE
+          echo "=== vulkan.hpp location in Vulkan-Hpp ==="
+          find /tmp/vulkan-hpp -name "vulkan.hpp" | head -5
 
       # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
       - name: Clone llamatik v0.14.0 (shallow)
@@ -126,14 +133,27 @@ jobs:
 
           echo "llama.cpp HEAD: $(git -C llama_cpp_src rev-parse HEAD 2>/dev/null || echo unknown)"
 
-          # Inject Vulkan-Headers into the path clang already searches.
+          # Inject Vulkan headers into the path clang already searches.
           # Compile command has: -I.../llama_cpp_src/ggml/src/../include
           #   = -I.../llama_cpp_src/ggml/include
-          # So vulkan/ must go into ggml/include/, not include/.
+          # So vulkan/ must go into ggml/include/vulkan/.
           mkdir -p llama_cpp_src/ggml/include/vulkan
+          # 1) C headers from Vulkan-Headers
           cp -r /tmp/vulkan-headers/include/vulkan/. llama_cpp_src/ggml/include/vulkan/
-          echo "Injected Vulkan-Headers version:"
+          # 2) C++ wrapper from Vulkan-Hpp (separate repo)
+          HPP=$(find /tmp/vulkan-hpp -name "vulkan.hpp" | head -1)
+          if [ -n "$HPP" ]; then
+            cp "$HPP" llama_cpp_src/ggml/include/vulkan/vulkan.hpp
+            echo "Copied vulkan.hpp from: $HPP"
+          else
+            echo "ERROR: vulkan.hpp not found in Vulkan-Hpp repo"
+            exit 1
+          fi
+          echo "=== Injected headers ==="
+          ls llama_cpp_src/ggml/include/vulkan/ | head -20
           grep "define VK_HEADER_VERSION " llama_cpp_src/ggml/include/vulkan/vulkan_core.h | grep -v COMPLETE
+          # Fail fast if vulkan.hpp is missing
+          test -f llama_cpp_src/ggml/include/vulkan/vulkan.hpp || { echo "ERROR: vulkan.hpp missing after inject"; exit 1; }
 
       # ── 6. Verify glslc is on PATH ────────────────────────────────────────────
       - name: Verify glslc
