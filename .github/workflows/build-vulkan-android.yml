@@ -138,8 +138,11 @@ jobs:
           #   = -I.../llama_cpp_src/ggml/include
           # So vulkan/ must go into ggml/include/vulkan/.
           mkdir -p llama_cpp_src/ggml/include/vulkan
-          # 1) C headers from Vulkan-Headers
+          # 1) C headers from Vulkan-Headers (vulkan/ and vk_video/ siblings)
           cp -r /tmp/vulkan-headers/include/vulkan/. llama_cpp_src/ggml/include/vulkan/
+          # vk_video/ is included by vulkan_core.h via relative path → must sit
+          # under the same -I root (ggml/include/) so clang resolves it correctly
+          cp -r /tmp/vulkan-headers/include/vk_video llama_cpp_src/ggml/include/
           # 2) C++ wrapper from Vulkan-Hpp (separate repo)
           HPP=$(find /tmp/vulkan-hpp -name "vulkan.hpp" | head -1)
           if [ -n "$HPP" ]; then
@@ -151,9 +154,10 @@ jobs:
           fi
           echo "=== Injected headers ==="
           ls llama_cpp_src/ggml/include/vulkan/ | head -20
+          ls llama_cpp_src/ggml/include/vk_video/ | head -10
           grep "define VK_HEADER_VERSION " llama_cpp_src/ggml/include/vulkan/vulkan_core.h | grep -v COMPLETE
-          # Fail fast if vulkan.hpp is missing
-          test -f llama_cpp_src/ggml/include/vulkan/vulkan.hpp || { echo "ERROR: vulkan.hpp missing after inject"; exit 1; }
+          test -f llama_cpp_src/ggml/include/vulkan/vulkan.hpp || { echo "ERROR: vulkan.hpp missing"; exit 1; }
+          test -d llama_cpp_src/ggml/include/vk_video || { echo "ERROR: vk_video/ missing"; exit 1; }
 
       # ── 6. Verify glslc is on PATH ────────────────────────────────────────────
       - name: Verify glslc
