@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build git python3 pkg-config \
-            libvulkan-dev glslang-tools spirv-tools shaderc
+            libvulkan-dev glslang-tools spirv-tools
 
       # ── 3. Android NDK r27c ───────────────────────────────────────────────────
       - name: Setup Android NDK r27c
@@ -119,20 +119,27 @@ jobs:
       - name: Locate glslc
         id: glslc
         run: |
-          # Priority 1: NDK bundles glslc from r25+
+          # Priority 1: NDK r25+ bundles glslc
           NDK_GLSLC="${{ steps.setup-ndk.outputs.ndk-path }}/shader-tools/linux-x86_64/glslc"
-          # Priority 2: system shaderc package provides /usr/bin/glslc
-          SYS_GLSLC="$(which glslc 2>/dev/null || true)"
+          echo "Checking NDK glslc path: $NDK_GLSLC"
+          ls -la "$(dirname $NDK_GLSLC)" 2>/dev/null || true
 
           if [ -f "$NDK_GLSLC" ]; then
             GLSLC="$NDK_GLSLC"
-            echo "Using NDK glslc: $GLSLC"
-          elif [ -n "$SYS_GLSLC" ]; then
-            GLSLC="$SYS_GLSLC"
-            echo "Using system glslc: $GLSLC"
+            echo "Using NDK glslc"
+          elif command -v glslc &>/dev/null; then
+            GLSLC="$(which glslc)"
+            echo "Using system glslc"
           else
-            echo "ERROR: glslc not found"
-            exit 1
+            # Fallback: download prebuilt glslc from Google shaderc releases
+            echo "glslc not found, downloading from shaderc releases..."
+            SHADERC_URL="https://storage.googleapis.com/shaderc/artifacts/prod/graphics_shader_compiler/shaderc/linux/continuous_clang_release/latest/install.tgz"
+            wget -q "$SHADERC_URL" -O shaderc.tgz
+            tar -xzf shaderc.tgz
+            GLSLC="$(find . -name glslc -type f | head -1)"
+            chmod +x "$GLSLC"
+            GLSLC="$(realpath $GLSLC)"
+            echo "Downloaded glslc: $GLSLC"
           fi
 
           "$GLSLC" --version
