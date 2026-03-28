@@ -36,30 +36,22 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Export NDK env vars, add glslc to PATH, copy vulkan.hpp to NDK sysroot
+      - name: Export NDK env vars and add glslc to PATH
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           echo "ANDROID_NDK=$NDK_PATH" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
-          # NDK r25+ bundles glslc — add to PATH so sub-builds (vulkan-shaders-gen) find it
           echo "$NDK_PATH/shader-tools/linux-x86_64" >> $GITHUB_PATH
 
-          # Copy vulkan.hpp from LunarG SDK into NDK sysroot so the cross-compiler finds it.
-          # NDK sysroot has vulkan.h but not vulkan.hpp (C++ wrapper).
-          NDK_SYSROOT="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          echo "=== LunarG vulkan headers ==="
-          find /usr/include/vulkan -name "*.hpp" 2>/dev/null | head -10 || echo "none found"
-          echo "=== NDK sysroot vulkan dir (before) ==="
-          ls "$NDK_SYSROOT/usr/include/vulkan/" 2>/dev/null || true
-
-          # NDK r27c ships vulkan_core.h v275, but ggml-vulkan.cpp needs v313.
-          # Replace ALL NDK vulkan headers with Khronos Vulkan-Headers v1.3.313
-          # (consistent set of both .h and .hpp — no mixing of sources).
+      # NDK r27c has vulkan_core.h v275 but ggml-vulkan.cpp needs v313.
+      # Clone Vulkan-Headers v1.3.313 to /tmp and inject via CXXFLAGS.
+      # -I takes priority over --sysroot so clang finds v313 headers first.
+      - name: Clone Vulkan-Headers v1.3.313
+        run: |
           git clone --depth=1 --branch "v1.3.313" \
-            https://github.com/KhronosGroup/Vulkan-Headers.git vulkan_headers
-          cp -r vulkan_headers/include/vulkan/. "$NDK_SYSROOT/usr/include/vulkan/"
-          echo "VK_HEADER_VERSION after replace:"
-          grep "define VK_HEADER_VERSION " "$NDK_SYSROOT/usr/include/vulkan/vulkan_core.h" | grep -v COMPLETE
+            https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          echo "VULKAN_HEADERS_INCLUDE=/tmp/vulkan-headers/include" >> $GITHUB_ENV
+          grep "define VK_HEADER_VERSION " /tmp/vulkan-headers/include/vulkan/vulkan_core.h | grep -v COMPLETE
 
       # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
       - name: Clone llamatik v0.14.0 (shallow)
@@ -143,6 +135,9 @@ jobs:
 
       # ── 7. CMake configure + build ────────────────────────────────────────────
       - name: Configure CMake
+        env:
+          # -I before sysroot → clang finds Vulkan-Headers v313 before NDK's v275
+          CXXFLAGS: "-I${{ env.VULKAN_HEADERS_INCLUDE }}"
         run: |
           cmake -S llama_cpp_src -B build_vulkan \
             -GNinja \
