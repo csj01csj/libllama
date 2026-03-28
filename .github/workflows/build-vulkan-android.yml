@@ -46,11 +46,10 @@ jobs:
       # NDK r27c has vulkan_core.h v275 but ggml-vulkan.cpp needs v313.
       # Clone Vulkan-Headers v1.3.313 to /tmp and inject via CXXFLAGS.
       # -I takes priority over --sysroot so clang finds v313 headers first.
-      - name: Clone Vulkan-Headers v1.3.313
+      - name: Clone Vulkan-Headers (latest)
         run: |
-          git clone --depth=1 --branch "v1.3.313" \
+          git clone --depth=1 \
             https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
-          echo "VULKAN_HEADERS_INCLUDE=/tmp/vulkan-headers/include" >> $GITHUB_ENV
           grep "define VK_HEADER_VERSION " /tmp/vulkan-headers/include/vulkan/vulkan_core.h | grep -v COMPLETE
 
       # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
@@ -136,8 +135,7 @@ jobs:
       # ── 7. CMake configure + build ────────────────────────────────────────────
       - name: Configure CMake
         env:
-          # -I before sysroot → clang finds Vulkan-Headers v313 before NDK's v275
-          CXXFLAGS: "-I${{ env.VULKAN_HEADERS_INCLUDE }}"
+          CXXFLAGS: "-I/tmp/vulkan-headers/include"
         run: |
           cmake -S llama_cpp_src -B build_vulkan \
             -GNinja \
