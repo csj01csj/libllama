@@ -126,13 +126,14 @@ jobs:
 
           echo "llama.cpp HEAD: $(git -C llama_cpp_src rev-parse HEAD 2>/dev/null || echo unknown)"
 
-          # Inject Vulkan-Headers into llama.cpp's include/ dir.
-          # The compile command already has -I.../llama_cpp_src/include so clang
-          # finds these headers BEFORE the NDK sysroot's outdated ones.
-          mkdir -p llama_cpp_src/include/vulkan
-          cp -r /tmp/vulkan-headers/include/vulkan/. llama_cpp_src/include/vulkan/
+          # Inject Vulkan-Headers into the path clang already searches.
+          # Compile command has: -I.../llama_cpp_src/ggml/src/../include
+          #   = -I.../llama_cpp_src/ggml/include
+          # So vulkan/ must go into ggml/include/, not include/.
+          mkdir -p llama_cpp_src/ggml/include/vulkan
+          cp -r /tmp/vulkan-headers/include/vulkan/. llama_cpp_src/ggml/include/vulkan/
           echo "Injected Vulkan-Headers version:"
-          grep "define VK_HEADER_VERSION " llama_cpp_src/include/vulkan/vulkan_core.h | grep -v COMPLETE
+          grep "define VK_HEADER_VERSION " llama_cpp_src/ggml/include/vulkan/vulkan_core.h | grep -v COMPLETE
 
       # ── 6. Verify glslc is on PATH ────────────────────────────────────────────
       - name: Verify glslc
