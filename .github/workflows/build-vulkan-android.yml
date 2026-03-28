@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build git python3 pkg-config \
-            libvulkan-dev glslang-tools spirv-tools
+            libvulkan-dev glslang-tools spirv-tools shaderc
 
       # ── 3. Android NDK r27c ───────────────────────────────────────────────────
       - name: Setup Android NDK r27c
@@ -119,19 +119,24 @@ jobs:
       - name: Locate glslc
         id: glslc
         run: |
-          # NDK bundles glslc starting from r25
+          # Priority 1: NDK bundles glslc from r25+
           NDK_GLSLC="${{ steps.setup-ndk.outputs.ndk-path }}/shader-tools/linux-x86_64/glslc"
+          # Priority 2: system shaderc package provides /usr/bin/glslc
+          SYS_GLSLC="$(which glslc 2>/dev/null || true)"
+
           if [ -f "$NDK_GLSLC" ]; then
-            echo "glslc=$NDK_GLSLC" >> $GITHUB_OUTPUT
-            echo "Found NDK glslc: $NDK_GLSLC"
-          elif command -v glslc &>/dev/null; then
-            echo "glslc=$(which glslc)" >> $GITHUB_OUTPUT
-            echo "Using system glslc"
+            GLSLC="$NDK_GLSLC"
+            echo "Using NDK glslc: $GLSLC"
+          elif [ -n "$SYS_GLSLC" ]; then
+            GLSLC="$SYS_GLSLC"
+            echo "Using system glslc: $GLSLC"
           else
-            # glslang-tools provides glslangValidator which llama.cpp also accepts
-            echo "glslc=$(which glslangValidator)" >> $GITHUB_OUTPUT
-            echo "Falling back to glslangValidator"
+            echo "ERROR: glslc not found"
+            exit 1
           fi
+
+          "$GLSLC" --version
+          echo "glslc=$GLSLC" >> $GITHUB_OUTPUT
 
       # ── 7. CMake configure + build ────────────────────────────────────────────
       - name: Configure CMake
@@ -143,13 +148,12 @@ jobs:
             -DANDROID_PLATFORM=android-26 \
             -DGGML_VULKAN=ON \
             -DGGML_NATIVE=OFF \
-            -DGGML_CPU_ARM_ARCH=armv8-a \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
             -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DGLSLC_PROGRAM="${{ steps.glslc.outputs.glslc }}"
+            -DVulkan_GLSLC_EXECUTABLE="${{ steps.glslc.outputs.glslc }}"
 
       - name: Build libggml-vulkan.so
         run: |
