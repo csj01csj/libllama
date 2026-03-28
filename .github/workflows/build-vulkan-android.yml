@@ -1,0 +1,195 @@
+name: Build libggml-vulkan.so (Android arm64-v8a)
+
+# Builds the Vulkan backend .so from the same llama.cpp version used by
+# llamatik 0.14.0, so it is ABI-compatible with the existing prebuilt .so files.
+
+on:
+  workflow_dispatch:          # run manually from GitHub Actions tab
+  push:
+    paths:
+      - '.github/workflows/build-vulkan-android.yml'
+
+jobs:
+  build-vulkan:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. System deps ────────────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build git python3 pkg-config \
+            libvulkan-dev glslang-tools spirv-tools
+
+      # ── 3. Android NDK r27c ───────────────────────────────────────────────────
+      - name: Setup Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Export NDK env vars
+        run: |
+          echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
+      - name: Clone llamatik v0.14.0 (shallow)
+        run: |
+          git clone --depth=1 --branch v0.14.0 \
+            https://github.com/ferranpons/Llamatik.git llamatik_src
+
+      - name: Extract llama.cpp git ref from llamatik CMakeLists
+        id: llama_ref
+        run: |
+          set -euo pipefail
+
+          # llamatik may embed llama.cpp as a submodule or via FetchContent.
+          # Try submodule path first.
+          SUBMODULE_DIR=$(find llamatik_src -maxdepth 3 \
+            \( -name "llama.cpp" -o -name "ggml" \) -type d | head -1 || true)
+
+          if [ -n "$SUBMODULE_DIR" ] && [ -f "$SUBMODULE_DIR/CMakeLists.txt" ]; then
+            echo "Found submodule at $SUBMODULE_DIR"
+            # Get the commit that HEAD points to inside the submodule
+            REF=$(git -C llamatik_src submodule status -- "$SUBMODULE_DIR" \
+              2>/dev/null | awk '{print $1}' | tr -d '-+' || true)
+            if [ -n "$REF" ]; then
+              echo "llama_ref=$REF" >> $GITHUB_OUTPUT
+              echo "llama_is_submodule=true" >> $GITHUB_OUTPUT
+              echo "llama_src_dir=$SUBMODULE_DIR" >> $GITHUB_OUTPUT
+              echo "Using submodule commit: $REF"
+              exit 0
+            fi
+          fi
+
+          # Fallback: parse FetchContent GIT_TAG from CMakeLists
+          CMAKE_FILE=$(find llamatik_src -name "CMakeLists.txt" \
+            | xargs grep -l "llama\.cpp\|ggml-org/llama\|GIT_REPOSITORY" 2>/dev/null \
+            | head -1 || true)
+
+          if [ -n "$CMAKE_FILE" ]; then
+            echo "Parsing $CMAKE_FILE for llama.cpp ref"
+            cat "$CMAKE_FILE"
+            REF=$(grep -A 5 "GIT_REPOSITORY" "$CMAKE_FILE" \
+              | grep "GIT_TAG" \
+              | grep -oP '(?<=GIT_TAG\s{0,10})[^\s)]+' \
+              | head -1 || true)
+            echo "Extracted ref: $REF"
+          fi
+
+          if [ -z "${REF:-}" ]; then
+            # Hard fallback: llamatik 0.14.0 released 2025-01-31 → llama.cpp ~b4500
+            REF="b4500"
+            echo "WARNING: Could not determine llama.cpp version, using fallback $REF"
+          fi
+
+          echo "llama_ref=$REF" >> $GITHUB_OUTPUT
+          echo "llama_is_submodule=false" >> $GITHUB_OUTPUT
+
+      # ── 5. Clone llama.cpp at the matching commit ─────────────────────────────
+      - name: Clone llama.cpp
+        run: |
+          REF="${{ steps.llama_ref.outputs.llama_ref }}"
+          IS_SUB="${{ steps.llama_ref.outputs.llama_is_submodule }}"
+
+          if [ "$IS_SUB" = "true" ] && [ -d "${{ steps.llama_ref.outputs.llama_src_dir }}" ]; then
+            echo "Using submodule directory already on disk"
+            cp -r "${{ steps.llama_ref.outputs.llama_src_dir }}" llama_cpp_src
+          else
+            echo "Cloning llama.cpp at ref: $REF"
+            git clone --depth=1 --branch "$REF" \
+              https://github.com/ggml-org/llama.cpp.git llama_cpp_src \
+              || git clone --depth=1 \
+                https://github.com/ggml-org/llama.cpp.git llama_cpp_src \
+              && git -C llama_cpp_src checkout "$REF"
+          fi
+
+          echo "llama.cpp HEAD: $(git -C llama_cpp_src rev-parse HEAD 2>/dev/null || echo unknown)"
+
+      # ── 6. Resolve glslc ──────────────────────────────────────────────────────
+      - name: Locate glslc
+        id: glslc
+        run: |
+          # NDK bundles glslc starting from r25
+          NDK_GLSLC="${{ steps.setup-ndk.outputs.ndk-path }}/shader-tools/linux-x86_64/glslc"
+          if [ -f "$NDK_GLSLC" ]; then
+            echo "glslc=$NDK_GLSLC" >> $GITHUB_OUTPUT
+            echo "Found NDK glslc: $NDK_GLSLC"
+          elif command -v glslc &>/dev/null; then
+            echo "glslc=$(which glslc)" >> $GITHUB_OUTPUT
+            echo "Using system glslc"
+          else
+            # glslang-tools provides glslangValidator which llama.cpp also accepts
+            echo "glslc=$(which glslangValidator)" >> $GITHUB_OUTPUT
+            echo "Falling back to glslangValidator"
+          fi
+
+      # ── 7. CMake configure + build ────────────────────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -S llama_cpp_src -B build_vulkan \
+            -GNinja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ARM_ARCH=armv8-a \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGLSLC_PROGRAM="${{ steps.glslc.outputs.glslc }}"
+
+      - name: Build libggml-vulkan.so
+        run: |
+          # Build only the Vulkan backend target
+          cmake --build build_vulkan --target ggml-vulkan -j$(nproc) \
+            || cmake --build build_vulkan --target ggml_vulkan -j$(nproc) \
+            || cmake --build build_vulkan -j$(nproc)   # full build as last resort
+
+          echo "=== Built .so files ==="
+          find build_vulkan -name "*.so" -type f | sort
+
+      # ── 8. Collect & upload ───────────────────────────────────────────────────
+      - name: Collect libggml-vulkan.so
+        run: |
+          mkdir -p output/arm64-v8a
+          find build_vulkan -name "libggml-vulkan.so" -exec cp {} output/arm64-v8a/ \;
+          echo "=== Output ==="
+          ls -lh output/arm64-v8a/
+          file output/arm64-v8a/libggml-vulkan.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libggml-vulkan-android-arm64-v8a
+          path: output/arm64-v8a/libggml-vulkan.so
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── 9. Create GitHub Release (only on manual trigger) ─────────────────────
+      - name: Create Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vulkan-build-${{ github.run_number }}
+          name: "libggml-vulkan.so (arm64-v8a) — build #${{ github.run_number }}"
+          body: |
+            Vulkan backend `.so` for Android arm64-v8a, built from llama.cpp
+            ref `${{ steps.llama_ref.outputs.llama_ref }}` (same as llamatik 0.14.0).
+
+            **Usage:** drop `libggml-vulkan.so` into `app/src/main/jniLibs/arm64-v8a/`
+            alongside the existing prebuilt `.so` files, then set `nGpuLayers > 0`
+            in your inference config.
+          files: output/arm64-v8a/libggml-vulkan.so
+          draft: false
+          prerelease: false

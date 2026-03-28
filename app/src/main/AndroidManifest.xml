@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />
+
+    <application
+        android:label="AIDE"
+        android:theme="@style/Theme.AICode"
+        android:requestLegacyExternalStorage="true"
+        android:largeHeap="true"
+        android:extractNativeLibs="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Disable androidx.startup auto-init (resource ID conflict with mixed library versions) -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            tools:node="remove" />
+
+        <!-- Engine: Local AI inference service -->
+        <service
+            android:name=".engine.AIInferenceService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="com.aicode.studio.engine.BIND_AI" />
+            </intent-filter>
+        </service>
+
+        <!-- Engine: Model management screen -->
+        <activity
+            android:name=".engine.ModelSelectActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AICode" />
+
+        <!-- Engine: Auto-restart on boot -->
+        <receiver
+            android:name=".engine.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

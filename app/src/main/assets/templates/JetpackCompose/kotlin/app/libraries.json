@@ -1,0 +1,55 @@
+[
+	{
+		"artifactId": "appcompat",
+		"groupId": "androidx.appcompat",
+		"scope": "compile",
+		"versionName": "1.4.1"
+	},
+      {
+		"artifactId": "material",
+		"groupId": "com.google.android.material",
+		"scope": "compile",
+		"versionName": "1.4.0"
+	},
+
+      {
+		"artifactId": "constraintlayout",
+		"groupId": "androidx.constraintlayout",
+		"scope": "compile",
+		"versionName": "2.1.0"
+	},
+
+      {
+		"artifactId": "activity-compose",
+		"groupId": "androidx.activity",
+		"excludes": [
+			{
+				"artifactId": "lifecycle-common-java8",
+				"groupId": "androidx.lifecycle"
+			}
+		],
+		"scope": "compile",
+		"versionName": "1.4.0"
+	},
+
+	{
+		"artifactId": "foundation",
+		"groupId": "androidx.compose.foundation",
+		"scope": "compile",
+		"versionName": "1.0.1"
+	},
+
+	{
+		"artifactId": "foundation-layout",
+		"groupId": "androidx.compose.foundation",
+		"scope": "compile",
+		"versionName": "1.0.1"
+	},
+
+	{
+		"artifactId": "material",
+		"groupId": "androidx.compose.material",
+		"scope": "compile",
+		"versionName": "1.0.1"
+	}
+]

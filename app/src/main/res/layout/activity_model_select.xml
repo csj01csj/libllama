@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/engine_bg_dark">
+
+    <androidx.appcompat.widget.Toolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="56dp"
+        android:background="@color/engine_surface_dark"
+        android:elevation="4dp" />
+
+    <TextView
+        android:id="@+id/tvHwSummary"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/engine_surface_dark"
+        android:padding="12dp"
+        android:textColor="@color/engine_accent_blue"
+        android:textSize="12sp" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/engine_divider" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:text="롱탭으로 설치된 모델 삭제"
+        android:textColor="@color/engine_text_hint"
+        android:textSize="11sp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recycler"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:padding="8dp"
+        android:clipToPadding="false" />
+
+</LinearLayout>

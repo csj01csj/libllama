@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.AICode" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <!-- Explicitly declare AppCompat sentinel attrs so createSubDecor() hasValue() check passes -->
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+
+        <item name="colorPrimary">#007ACC</item>
+        <item name="colorPrimaryDark">#005A9E</item>
+        <item name="colorAccent">#03DAC6</item>
+        <item name="android:windowBackground">#121212</item>
+        <item name="android:statusBarColor">#252526</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>

@@ -1,0 +1,407 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.drawerlayout.widget.DrawerLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/drawerLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#121212">
+
+    <!-- ═══ MAIN CONTENT ═══ -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <!-- ── TOOLBAR ── -->
+        <RelativeLayout
+            android:id="@+id/toolbar"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:background="#1E1E1E"
+            android:gravity="center_vertical">
+
+            <ImageButton
+                android:id="@+id/btnMenu"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_sort_by_size"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:tint="#FFFFFF"
+                android:layout_centerVertical="true" />
+
+            <TextView
+                android:id="@+id/tvProjectTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AIDE"
+                android:textColor="#007ACC"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:layout_toEndOf="@id/btnMenu"
+                android:layout_centerVertical="true"
+                android:layout_marginStart="8dp" />
+
+            <TextView
+                android:id="@+id/tvCurrentFile"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#888888"
+                android:textSize="11sp"
+                android:layout_toEndOf="@id/tvProjectTitle"
+                android:layout_centerVertical="true"
+                android:layout_marginStart="8dp"
+                android:singleLine="true"
+                android:ellipsize="start" />
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:orientation="horizontal">
+
+                <ImageButton
+                    android:id="@+id/btnUndo"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:src="@android:drawable/ic_menu_revert"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#888" />
+
+                <ImageButton
+                    android:id="@+id/btnRedo"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:src="@android:drawable/ic_menu_rotate"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#888" />
+
+                <ImageButton
+                    android:id="@+id/btnSync"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:src="@android:drawable/ic_popup_sync"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#4CAF50"
+                    android:layout_marginEnd="4dp" />
+
+                <Button
+                    android:id="@+id/btnRun"
+                    android:layout_width="64dp"
+                    android:layout_height="34dp"
+                    android:text="RUN"
+                    android:textSize="11sp"
+                    android:backgroundTint="#007ACC"
+                    android:textColor="#FFF"
+                    android:layout_marginStart="4dp" />
+            </LinearLayout>
+        </RelativeLayout>
+
+        <!-- ── TAB BAR ── -->
+        <HorizontalScrollView
+            android:id="@+id/tabScrollView"
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:background="#252526"
+            android:scrollbars="none">
+            <LinearLayout
+                android:id="@+id/tabContainer"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:orientation="horizontal" />
+        </HorizontalScrollView>
+
+        <!-- ── CODE EDITOR ── -->
+        <com.aicode.studio.editor.CodeEditorView
+            android:id="@+id/codeEditor"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <!-- ── SYMBOL BAR (코드 심볼 빠른입력) ── -->
+        <HorizontalScrollView
+            android:id="@+id/symbolBarScroll"
+            android:layout_width="match_parent"
+            android:layout_height="36dp"
+            android:background="#2D2D2D"
+            android:scrollbars="none">
+            <LinearLayout
+                android:id="@+id/symbolBar"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="4dp" />
+        </HorizontalScrollView>
+
+        <!-- ── STATUS / AI STATUS ── -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#1A1A1A"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="3dp"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Ready"
+                android:textColor="#4CAF50"
+                android:textSize="11sp"
+                android:singleLine="true" />
+
+            <TextView
+                android:id="@+id/tvCursorPos"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Ln 1, Col 1"
+                android:textColor="#666"
+                android:textSize="10sp" />
+        </LinearLayout>
+
+        <!-- ── LOG PANEL (접기 가능) ── -->
+        <LinearLayout
+            android:id="@+id/logPanel"
+            android:layout_width="match_parent"
+            android:layout_height="120dp"
+            android:orientation="vertical"
+            android:background="#0D0D0D">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="24dp"
+                android:background="#1A1A1A"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="8dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="OUTPUT"
+                    android:textColor="#888"
+                    android:textSize="10sp"
+                    android:textStyle="bold" />
+
+                <ImageButton
+                    android:id="@+id/btnClearLog"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:src="@android:drawable/ic_menu_close_clear_cancel"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#666"
+                    android:scaleType="centerInside" />
+
+                <ImageButton
+                    android:id="@+id/btnToggleLog"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:src="@android:drawable/arrow_down_float"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#666"
+                    android:scaleType="centerInside" />
+            </LinearLayout>
+
+            <ScrollView
+                android:id="@+id/logScroll"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent">
+                <TextView
+                    android:id="@+id/logText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:padding="8dp"
+                    android:textColor="#00FF00"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:textIsSelectable="true"
+                    android:text="> AIDE Engine Ready" />
+            </ScrollView>
+        </LinearLayout>
+
+        <!-- ── AI INPUT PANEL ── -->
+        <LinearLayout
+            android:id="@+id/aiPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#1E1E1E"
+            android:padding="6dp">
+
+            <!-- API Config Container (Supports multiple keys) -->
+            <LinearLayout
+                android:id="@+id/apiConfigRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <ScrollView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:maxHeight="200dp">
+                    <LinearLayout
+                        android:id="@+id/apiListContainer"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical" />
+                </ScrollView>
+
+                <!-- Local AI 컨트롤 행 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="36dp"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="4dp">
+
+                    <Switch
+                        android:id="@+id/switchLocalAI"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Local AI"
+                        android:textColor="#AAA"
+                        android:textSize="11sp"
+                        android:thumbTint="#007ACC"
+                        android:trackTint="#333" />
+
+                    <Button
+                        android:id="@+id/btnManageLocalAI"
+                        android:layout_width="wrap_content"
+                        android:layout_height="30dp"
+                        android:text="Manage Local AI"
+                        android:textSize="10sp"
+                        android:backgroundTint="#2A2A2A"
+                        android:textColor="#888"
+                        android:layout_marginStart="8dp" />
+
+                    <View
+                        android:layout_width="0dp"
+                        android:layout_height="1dp"
+                        android:layout_weight="1" />
+
+                    <Button
+                        android:id="@+id/btnAddApi"
+                        android:layout_width="wrap_content"
+                        android:layout_height="32dp"
+                        android:text="+ Add API Key"
+                        android:textSize="10sp"
+                        android:backgroundTint="#333"
+                        android:textColor="#FFF" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- AI 입력 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginTop="2dp">
+
+                <ImageButton
+                    android:id="@+id/btnToggleApiConfig"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:src="@android:drawable/ic_menu_manage"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#666" />
+
+                <EditText
+                    android:id="@+id/etAiInput"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="AI에게 명령..."
+                    android:textColorHint="#555"
+                    android:textColor="#FFF"
+                    android:background="@null"
+                    android:padding="8dp"
+                    android:textSize="13sp"
+                    android:maxLines="3"
+                    android:inputType="textMultiLine" />
+
+                <ImageButton
+                    android:id="@+id/btnStopAI"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:src="@android:drawable/ic_media_pause"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#FF5555"
+                    android:visibility="gone" />
+
+                <ImageButton
+                    android:id="@+id/btnSendAI"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:src="@android:drawable/ic_menu_send"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:tint="#007ACC" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ═══ DRAWER (EXPLORER) ═══ -->
+    <LinearLayout
+        android:id="@+id/drawerContent"
+        android:layout_width="280dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:background="#1E1E1E"
+        android:orientation="vertical"
+        android:clickable="true"
+        android:focusable="true">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="EXPLORER"
+            android:padding="14dp"
+            android:textColor="#007ACC"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <ListView
+            android:id="@+id/fileListView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:divider="@null"
+            android:dividerHeight="0dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#333" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="8dp">
+
+            <Button
+                android:id="@+id/btnNewProject"
+                android:layout_width="0dp"
+                android:layout_height="36dp"
+                android:layout_weight="1"
+                android:text="+ NEW"
+                android:textSize="11sp"
+                android:backgroundTint="#007ACC" />
+
+            <Button
+                android:id="@+id/btnSwitchProject"
+                android:layout_width="0dp"
+                android:layout_height="36dp"
+                android:layout_weight="1"
+                android:text="SWITCH"
+                android:textSize="11sp"
+                android:backgroundTint="#333"
+                android:layout_marginStart="4dp" />
+        </LinearLayout>
+    </LinearLayout>
+</androidx.drawerlayout.widget.DrawerLayout>
