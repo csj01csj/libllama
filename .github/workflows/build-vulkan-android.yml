@@ -57,19 +57,14 @@ jobs:
           echo "=== NDK sysroot vulkan dir (before) ==="
           ls "$NDK_SYSROOT/usr/include/vulkan/" 2>/dev/null || true
 
-          if [ -f /usr/include/vulkan/vulkan.hpp ]; then
-            cp /usr/include/vulkan/vulkan.hpp "$NDK_SYSROOT/usr/include/vulkan/"
-            echo "Copied vulkan.hpp to NDK sysroot"
+          # Copy ALL Vulkan C++ headers (vulkan.hpp pulls in vulkan_hpp_macros.hpp etc.)
+          if ls /usr/include/vulkan/*.hpp &>/dev/null; then
+            cp /usr/include/vulkan/*.hpp "$NDK_SYSROOT/usr/include/vulkan/"
+            echo "Copied all .hpp files from LunarG SDK"
           else
-            echo "vulkan.hpp not at /usr/include/vulkan — trying to find it"
-            HPP=$(find /usr /opt -name "vulkan.hpp" 2>/dev/null | head -1)
-            if [ -n "$HPP" ]; then
-              cp "$HPP" "$NDK_SYSROOT/usr/include/vulkan/"
-              echo "Copied from $HPP"
-            else
-              echo "ERROR: vulkan.hpp not found anywhere"
-              exit 1
-            fi
+            echo "LunarG hpp files not found, cloning Vulkan-Headers from KhronosGroup"
+            git clone --depth=1 https://github.com/KhronosGroup/Vulkan-Headers.git vulkan_headers
+            cp vulkan_headers/include/vulkan/*.hpp "$NDK_SYSROOT/usr/include/vulkan/"
           fi
           echo "=== NDK sysroot vulkan dir (after) ==="
           ls "$NDK_SYSROOT/usr/include/vulkan/"
