@@ -140,6 +140,7 @@ jobs:
             -DGGML_VULKAN=ON \
             -DGGML_NATIVE=OFF \
             -DVulkan_INCLUDE_DIR=/usr/include \
+            "-DCMAKE_CXX_FLAGS=-I/usr/include" \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
