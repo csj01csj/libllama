@@ -194,6 +194,16 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_BUILD_TYPE=Release
 
+      # cmake detects glslc supports coopmat → sets -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT.
+      # But the shader generator only produces fp32 shaders (coopmat compile fails
+      # silently for the Android target), so *_coopmat_* symbols are never emitted.
+      # Patch build.ninja to strip the define so ggml-vulkan.cpp uses fp32 shaders.
+      - name: Strip COOPMAT define from build.ninja
+        run: |
+          sed -i 's/-DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT//g' build_vulkan/build.ninja
+          echo "COOPMAT_GLSLC_SUPPORT occurrences remaining:"
+          grep -c "COOPMAT_GLSLC_SUPPORT" build_vulkan/build.ninja || echo "0 — removed OK"
+
       - name: Build libggml-vulkan.so
         run: |
           # Build only the Vulkan backend target
