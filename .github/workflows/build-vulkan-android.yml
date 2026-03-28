@@ -57,17 +57,24 @@ jobs:
           echo "=== NDK sysroot vulkan dir (before) ==="
           ls "$NDK_SYSROOT/usr/include/vulkan/" 2>/dev/null || true
 
-          # Copy ALL Vulkan C++ headers (vulkan.hpp pulls in vulkan_hpp_macros.hpp etc.)
-          if ls /usr/include/vulkan/*.hpp &>/dev/null; then
-            cp /usr/include/vulkan/*.hpp "$NDK_SYSROOT/usr/include/vulkan/"
-            echo "Copied all .hpp files from LunarG SDK"
-          else
-            echo "LunarG hpp files not found, cloning Vulkan-Headers from KhronosGroup"
-            git clone --depth=1 https://github.com/KhronosGroup/Vulkan-Headers.git vulkan_headers
-            cp vulkan_headers/include/vulkan/*.hpp "$NDK_SYSROOT/usr/include/vulkan/"
-          fi
+          # vulkan.hpp (from LunarG) and vulkan_core.h (from NDK) must be the SAME version.
+          # Find what version vulkan.hpp requires, then clone matching Vulkan-Headers,
+          # and replace ALL headers in NDK sysroot with the consistent set.
+          HPP_VER=$(grep -r "define VK_HEADER_VERSION " /usr/include/vulkan/ 2>/dev/null \
+            | grep -v "COMPLETE" | head -1 | awk '{print $NF}')
+          echo "vulkan.hpp requires VK_HEADER_VERSION: $HPP_VER"
+
+          VK_TAG="vulkan-sdk-1.3.${HPP_VER}.0"
+          echo "Cloning Vulkan-Headers at $VK_TAG"
+          git clone --depth=1 --branch "$VK_TAG" \
+            https://github.com/KhronosGroup/Vulkan-Headers.git vulkan_headers \
+            || git clone --depth=1 \
+              https://github.com/KhronosGroup/Vulkan-Headers.git vulkan_headers
+
+          # Replace ALL vulkan headers in NDK sysroot (both .h and .hpp)
+          cp -r vulkan_headers/include/vulkan/. "$NDK_SYSROOT/usr/include/vulkan/"
           echo "=== NDK sysroot vulkan dir (after) ==="
-          ls "$NDK_SYSROOT/usr/include/vulkan/"
+          ls "$NDK_SYSROOT/usr/include/vulkan/" | head -20
 
       # ── 4. Find llama.cpp version from llamatik 0.14.0 ────────────────────────
       - name: Clone llamatik v0.14.0 (shallow)
