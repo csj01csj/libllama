@@ -213,12 +213,30 @@ jobs:
             [ -n "$LLAMA_H" ] && cp "$LLAMA_H" output/ && echo "Copied llama.h from source"
           }
 
-      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS Mode) ──────────────────
+      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2) ──────────────────
       - name: Patch ggml-vulkan.cpp for Adreno Stability
         run: |
-          cat <<'EOF' > patch_aus.py
+          cat <<'EOF' > patch_aus_v2.py
           import os
+          import re
           import sys
+
+          def get_function_block(content, func_name):
+              # 함수 이름으로 시작하는 위치 탐색
+              match = re.search(r'\w+\s+' + func_name + r'\s*\([^)]*\)\s*\{', content)
+              if not match: return None, None
+              
+              start_idx = match.start()
+              brace_count = 0
+              end_idx = -1
+              for i in range(match.end() - 1, len(content)):
+                  if content[i] == '{': brace_count += 1
+                  elif content[i] == '}':
+                      brace_count -= 1
+                      if brace_count == 0:
+                          end_idx = i + 1
+                          break
+              return start_idx, end_idx
 
           def patch():
               target = None
@@ -226,58 +244,69 @@ jobs:
                   if 'ggml-vulkan.cpp' in files:
                       target = os.path.join(root, 'ggml-vulkan.cpp')
                       break
-              if not target:
-                  print("Error: ggml-vulkan.cpp not found")
-                  sys.exit(1)
+              if not target: sys.exit(1)
               
-              with open(target, 'r') as f:
-                  content = f.read()
+              with open(target, 'r') as f: content = f.read()
 
-              # 1. Define AUS Sync Helper at the top of ggml-vulkan.cpp
+              # 1. Define AUS Sync Helper (Robust Submission)
               if 'void vk_aus_sync' not in content:
-                  sync_func = (
-                      '\nstatic void vk_aus_sync(ggml_vk_context * ctx) {\n'
-                      '    if (ctx->device->name.find("Adreno") == std::string::npos) return;\n'
-                      '    vkEndCommandBuffer(ctx->cur_cb->cb);\n'
-                      '    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr };\n'
-                      '    vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);\n'
-                      '    vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000);\n'
-                      '    vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence);\n'
-                      '    vkResetCommandBuffer(ctx->cur_cb->cb, 0);\n'
-                      '    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr };\n'
-                      '    vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);\n'
-                      '}\n'
-                  )
-                  # Insert after includes
-                  content = content.replace('#include', sync_func + '#include', 1)
+                  sync_func = """
+          static void vk_aus_sync(ggml_vk_context * ctx) {
+              if (ctx->device->name.find("Adreno") == std::string::npos) return;
+              vkEndCommandBuffer(ctx->cur_cb->cb);
+              VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr };
+              vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);
+              vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000);
+              vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence);
+              vkResetCommandBuffer(ctx->cur_cb->cb, 0);
+              VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr };
+              vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);
+          }
+          """
+                  content = content.replace('#include', sync_func + '\n#include', 1)
 
-              # 2. Disable subgroup arithmetic and shuffles if Adreno
-              init_pattern = 'device->name = props.deviceName;'
-              if init_pattern in content:
-                  content = content.replace(init_pattern, 
-                      'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n        fprintf(stderr, "Vulkan: Adreno AUS Mode (Ultra-Stable) Enabled\\n");\n    }')
+              # 2. Adreno Safe Mode Detection
+              content = content.replace('device->name = props.deviceName;', 
+                  'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n    }')
 
-              # 3. Force Flash Attention off for Adreno
-              content = content.replace('ctx->pipeline_flash_attn =', 
-                  'if (ctx->device->name.find("Adreno") != std::string::npos) ctx->pipeline_flash_attn = nullptr; else ctx->pipeline_flash_attn =')
+              # 3. Selective Node Splitting (Performance Optimization)
+              # Target: ggml_vk_graph_compute or ggml_vulkan_compute_graph
+              for func_name in ['ggml_vk_graph_compute', 'ggml_vulkan_compute_graph']:
+                  s, e = get_function_block(content, func_name)
+                  if s:
+                      block = content[s:e]
+                      # 연산 노드 실행 루프 내부에 선택적 sync 삽입
+                      # MatMul, Softmax 등 무거운 연산 후에만 submit
+                      dispatch_call = 'ggml_vk_dispatch_node(ctx, node);'
+                      if dispatch_call in block:
+                          safe_dispatch = dispatch_call + """
+                  if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) {
+                      vk_aus_sync(ctx);
+                  }"""
+                          content = content[:s] + block.replace(dispatch_call, safe_dispatch) + content[e:]
 
-              # 4. Patch Softmax internal split (Find the pattern: Max Kernel -> Barrier -> Norm Kernel)
-              # Standard ggml-vulkan uses multiple vkCmdDispatch for softmax.
-              # We find where it switches from max to norm and inject vk_aus_sync.
-              if 'vk_aus_sync(ctx);' not in content:
-                  # This is a heuristic but stable for llama.cpp's softmax implementation
-                  # It usually has a barrier between passes.
-                  content = content.replace('vkCmdPipelineBarrier(ctx->cur_cb->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT',
-                                          'vk_aus_sync(ctx);\n        vkCmdPipelineBarrier(ctx->cur_cb->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT')
+              # 4. Softmax Internal Split (Max -> Norm)
+              # llama.cpp의 softmax 구현 함수 탐색
+              for func_name in ['ggml_vk_softmax', 'ggml_vulkan_softmax']:
+                  s, e = get_function_block(content, func_name)
+                  if s:
+                      block = content[s:e]
+                      # 첫 번째 dispatch와 두 번째 dispatch 사이의 지점 탐색
+                      # 보통 barrier()나 pipeline 바인딩이 일어남
+                      dispatches = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
+                      if len(dispatches) >= 2:
+                          # 두 번째 dispatch 바로 직전에 sync 삽입
+                          # llama.cpp는 dispatch 전에 항상 pipeline/descriptor를 새로 바인딩함
+                          insert_pos = block.rfind('\n', 0, dispatches[1])
+                          new_block = block[:insert_pos] + '\n        vk_aus_sync(ctx);' + block[insert_pos:]
+                          content = content[:s] + new_block + content[e:]
 
-              # 5. Split submission at node level (Main loop)
-              dispatch_pattern = 'ggml_vk_dispatch_node(ctx, node);'
-              if dispatch_pattern in content:
-                  content = content.replace(dispatch_pattern, 'ggml_vk_dispatch_node(ctx, node);\n        vk_aus_sync(ctx);')
+              with open(target, 'w') as f: f.write(content)
+              print("AUS v2 Patch applied successfully")
 
-              with open(target, 'w') as f:
-                  f.write(content)
-              print("Enhanced AUS Patch applied with Softmax internal split")
+          if __name__ == "__main__": patch()
+          EOF
+          python3 patch_aus_v2.py
 
               with open(target, 'w') as f:
                   f.write(content)
