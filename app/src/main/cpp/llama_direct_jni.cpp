@@ -17,6 +17,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <setjmp.h>
+#include <signal.h>
 
 #include "llama.h"
 
@@ -26,11 +28,130 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 /* ── Global engine state ─────────────────────────────────────────────────────── */
-static struct llama_model        *g_model         = nullptr;
-static const struct llama_vocab  *g_vocab         = nullptr;  /* &model->vocab via llama_model_get_vocab() */
-static struct llama_context      *g_ctx           = nullptr;
-static std::atomic<bool>          g_stop          {false};
-static bool                       g_backend_inited = false;
+static struct llama_model        *g_model           = nullptr;
+static const struct llama_vocab  *g_vocab           = nullptr;
+static struct llama_context      *g_ctx             = nullptr;
+static std::atomic<bool>          g_stop            {false};
+static bool                       g_backend_inited  = false;
+static bool                       g_vulkan_available = false;
+
+/* ── Vulkan crash-protection state ───────────────────────────────────────────── */
+static sigjmp_buf                     g_vk_init_jmp;
+static volatile sig_atomic_t          g_in_vk_init = 0;
+static struct sigaction               g_saved_sigsegv;
+static struct sigaction               g_saved_sigbus;
+
+static void vk_init_crash_handler(int sig, siginfo_t * /*info*/, void * /*ctx*/) {
+    if (g_in_vk_init) {
+        g_in_vk_init = 0;
+        siglongjmp(g_vk_init_jmp, sig);
+    }
+    /* Not our crash — restore original handler and re-raise */
+    sigaction(SIGSEGV, &g_saved_sigsegv, nullptr);
+    sigaction(SIGBUS,  &g_saved_sigbus,  nullptr);
+    raise(sig);
+}
+
+/**
+ * Call llama_backend_init() with SIGSEGV/SIGBUS crash protection.
+ *
+ * On Adreno 830 (Snapdragon 8 Elite / S25+), the Vulkan driver can crash
+ * inside llama_backend_init() with SIGSEGV at fault addr 0x63.
+ * This wrapper catches the crash via siglongjmp, disables Vulkan via
+ * GGML_VK_DISABLE=1, and retries the init CPU-only.
+ *
+ * Sets g_vulkan_available = true only if the first (Vulkan-enabled) attempt
+ * completes without crashing.
+ */
+static void safe_backend_init() {
+    struct sigaction sa{};
+    sa.sa_sigaction = vk_init_crash_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, &g_saved_sigsegv);
+    sigaction(SIGBUS,  &sa, &g_saved_sigbus);
+
+    g_in_vk_init = 1;
+    int crash_sig = sigsetjmp(g_vk_init_jmp, 1);
+
+    if (crash_sig == 0) {
+        /* Normal path — Vulkan not disabled, attempt GPU init */
+        llama_backend_init();
+        g_in_vk_init = 0;
+        sigaction(SIGSEGV, &g_saved_sigsegv, nullptr);
+        sigaction(SIGBUS,  &g_saved_sigbus,  nullptr);
+        g_vulkan_available = true;
+        LOGI("llama_backend_init() OK — Vulkan available");
+    } else {
+        /* Crash caught via signal handler */
+        LOGW("llama_backend_init() crashed (signal %d, likely Vulkan driver bug) "
+             "— disabling Vulkan and retrying CPU-only", crash_sig);
+        sigaction(SIGSEGV, &g_saved_sigsegv, nullptr);
+        sigaction(SIGBUS,  &g_saved_sigbus,  nullptr);
+        g_in_vk_init = 0;
+
+        setenv("GGML_VK_DISABLE", "1", 1);
+        g_vulkan_available = false;
+
+        /* Retry with Vulkan disabled.  CPU backends should initialise cleanly. */
+        llama_backend_init();
+        LOGI("llama_backend_init() retry (CPU-only) OK");
+    }
+}
+
+/**
+ * Load a model with crash protection for GPU paths.
+ *
+ * On devices where the Vulkan backend initialises but then crashes during
+ * model memory mapping (e.g. Adreno 830 fault addr 0x63 in
+ * llama_model_load_from_file), we catch the SIGSEGV, fall back to CPU-only
+ * (n_gpu_layers = 0) and retry.
+ *
+ * @param path         Model file path.
+ * @param mparams      Model params (mparams.n_gpu_layers may be mutated to 0
+ *                     if the GPU load crashes).
+ * @return             Loaded llama_model*, or nullptr on failure.
+ */
+static struct llama_model* safe_load_model(const char *path,
+                                           llama_model_params &mparams)
+{
+    /* CPU-only path: no need for signal protection */
+    if (mparams.n_gpu_layers == 0) {
+        return llama_load_model_from_file(path, mparams);
+    }
+
+    /* GPU path: install crash guard */
+    struct sigaction sa{}, saved_segv{}, saved_bus{};
+    sa.sa_sigaction = vk_init_crash_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, &saved_segv);
+    sigaction(SIGBUS,  &sa, &saved_bus);
+
+    g_in_vk_init = 1;
+    int crash_sig = sigsetjmp(g_vk_init_jmp, 1);
+
+    if (crash_sig == 0) {
+        struct llama_model *model = llama_load_model_from_file(path, mparams);
+        g_in_vk_init = 0;
+        sigaction(SIGSEGV, &saved_segv, nullptr);
+        sigaction(SIGBUS,  &saved_bus,  nullptr);
+        return model;
+    }
+
+    /* Crash during GPU model load — fall back to CPU */
+    LOGW("llama_load_model_from_file crashed (signal %d) with n_gpu_layers=%d "
+         "— disabling Vulkan and retrying CPU-only", crash_sig, (int)mparams.n_gpu_layers);
+    sigaction(SIGSEGV, &saved_segv, nullptr);
+    sigaction(SIGBUS,  &saved_bus,  nullptr);
+    g_in_vk_init = 0;
+
+    g_vulkan_available = false;
+    setenv("GGML_VK_DISABLE", "1", 1);
+    mparams.n_gpu_layers = 0;
+
+    return llama_load_model_from_file(path, mparams);
+}
 
 /* ── JNI class/method cache ──────────────────────────────────────────────────── */
 static JavaVM   *g_jvm           = nullptr;
@@ -45,12 +166,9 @@ static jmethodID g_mid_on_error  = nullptr;
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
     g_jvm = vm;
     // Do NOT call llama_backend_init() here.
-    // JNI_OnLoad fires when System.loadLibrary() is called, which happens BEFORE
-    // NativeConfig.setEnv("GGML_VK_DISABLE", "1") is called by Kotlin.
-    // Calling llama_backend_init() here would initialize the Vulkan backend with
-    // no env-var guards, causing SIGSEGV at fault addr 0x18 on Adreno 830 (S25+).
-    // Instead, llama_backend_init() is called at the top of nativeInit(), by which
-    // point all env vars have already been set by the Kotlin caller.
+    // JNI_OnLoad fires when System.loadLibrary() is called.
+    // llama_backend_init() is called inside nativeInit() where safe_backend_init()
+    // handles any Vulkan driver crash via sigsetjmp/siglongjmp.
     return JNI_VERSION_1_6;
 }
 
@@ -65,14 +183,19 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
         jint n_ctx, jint n_batch, jint n_ubatch,
         jint n_gpu_layers, jint n_threads)
 {
-    /* Initialise ggml backends NOW (env vars already set by Kotlin caller).
-     * GGML_VK_DISABLE=1 is read here → Vulkan backend skipped on S25+/Adreno 830.
-     * Guard prevents double-init if nativeInit is called more than once. */
+    /* Initialise ggml backends (signal-protected; auto-falls back to CPU if
+     * Vulkan driver crashes).  Guard prevents double-init across model reloads. */
     if (!g_backend_inited) {
-        llama_backend_init();
+        safe_backend_init();
         g_backend_inited = true;
-        LOGI("llama_backend_init() done (GGML_VK_DISABLE=%s)",
-             getenv("GGML_VK_DISABLE") ? getenv("GGML_VK_DISABLE") : "unset");
+        LOGI("Backend init complete — Vulkan=%s", g_vulkan_available ? "YES" : "NO");
+    }
+
+    /* If Vulkan is not available, override GPU layer request to 0 */
+    jint effective_gpu_layers = g_vulkan_available ? n_gpu_layers : 0;
+    if (effective_gpu_layers == 0 && n_gpu_layers > 0) {
+        LOGW("GPU layers requested (%d) but Vulkan unavailable — using CPU only",
+             (int)n_gpu_layers);
     }
 
     /* Tear down any existing session */
@@ -81,19 +204,24 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
     g_vocab = nullptr;
 
     const char *model_path = env->GetStringUTFChars(j_model_path, nullptr);
-    LOGI("Loading model: %s  ctx=%d batch=%d ubatch=%d gpu_layers=%d threads=%d",
-         model_path, n_ctx, n_batch, n_ubatch, n_gpu_layers, n_threads);
+    LOGI("Loading model: %s  ctx=%d batch=%d ubatch=%d gpu_layers=%d (requested=%d) threads=%d",
+         model_path, n_ctx, n_batch, n_ubatch, (int)effective_gpu_layers, (int)n_gpu_layers, n_threads);
 
     /* ── Model params ── */
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = (int32_t)n_gpu_layers;
+    mparams.n_gpu_layers = (int32_t)effective_gpu_layers;
 
-    g_model = llama_load_model_from_file(model_path, mparams);
+    g_model = safe_load_model(model_path, mparams);
     env->ReleaseStringUTFChars(j_model_path, model_path);
 
     if (!g_model) {
-        LOGE("llama_load_model_from_file failed");
+        LOGE("safe_load_model failed");
         return -1;
+    }
+
+    /* Update effective GPU status after potential CPU fallback in safe_load_model */
+    if (mparams.n_gpu_layers == 0 && effective_gpu_layers > 0) {
+        LOGW("Model loaded CPU-only (GPU load crashed) — Vulkan disabled for this session");
     }
 
     /* Cache vocab handle – all tokeniser/token functions take llama_vocab* in this build */
@@ -139,6 +267,16 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
     LOGI("Model ready. n_ctx=%d n_batch=%d",
          llama_n_ctx(g_ctx), llama_n_batch(g_ctx));
     return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  nativeIsGpuAvailable() – returns true if Vulkan init succeeded
+ * ───────────────────────────────────────────────────────────────────────────── */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeIsGpuAvailable(
+        JNIEnv * /*env*/, jclass /*clazz*/)
+{
+    return g_vulkan_available ? JNI_TRUE : JNI_FALSE;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────

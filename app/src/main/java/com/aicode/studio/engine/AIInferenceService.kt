@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
+import android.os.Build
 
 /**
  * 백그라운드 AI 추론 포그라운드 서비스 (직접 llama.cpp JNI 기반).
@@ -116,13 +117,17 @@ class AIInferenceService : Service() {
             ACTION_START -> {
                 val id    = intent.getStringExtra(InferenceConfig.KEY_MODEL_ID) ?: return START_STICKY
                 val model = InferenceConfig.ALL_MODELS.firstOrNull { it.id == id } ?: return START_STICKY
+                // 모델이 변경되면 클라이언트에 알림
+                val prevModel = activeModel
+                if (prevModel != null && prevModel.id != model.id) {
+                    broadcastRaw("MODEL_CHANGED:${prevModel.displayName} → ${model.displayName}")
+                }
                 // Store the model to load, but do NOT load it yet.
                 // Model loading starts lazily on the first doGenerate() call.
                 // This prevents the heavy model load (and potential GPU crash) at app startup.
                 pendingModel = model
                 activeModel  = model
                 setState(State.READY)
-                updateNotif("${model.displayName} 대기 중 (첫 메시지에 로드)")
             }
             ACTION_STOP -> stopSelf()
         }
@@ -169,11 +174,11 @@ class AIInferenceService : Service() {
                 val nBatch  = nCtx
                 val nUbatch = nBatch.coerceAtMost(512)
 
-                // CPU-only: Vulkan backend (GGML Vulkan) crashes on Adreno 830 (S25+)
-                // because our prebuilt libllama.so / libggml.so doesn't fully support it.
-                // Disable unconditionally until a Vulkan-safe build is available.
-                NativeConfig.setEnv("GGML_VK_DISABLE", "1")
-                val nGpuLayers = 0
+                // GPU layers: attempt Vulkan when the hardware profile recommends it.
+                // The JNI layer (safe_backend_init) will catch any driver crash via
+                // sigsetjmp/siglongjmp and automatically fall back to CPU-only,
+                // so it is safe to pass n_gpu_layers > 0 here unconditionally.
+                val nGpuLayers = if (profile.hasVulkan) 99 else 0
                 val nThreads   = profile.cores.coerceAtMost(8)
 
                 val ret = withContext(nativeContext) {
@@ -199,10 +204,12 @@ class AIInferenceService : Service() {
                 activeModel = model
                 if (!model.supportsThinking) thinkingEnabled = false
 
+                val gpuOk = LlamaBridgeDirect.nativeIsGpuAvailable()
+                val backendLabel = if (gpuOk) "GPU (Vulkan)" else "CPU"
                 setState(State.READY)
-                updateNotif("${model.displayName}${if (model.supportsThinking && thinkingEnabled) " 🧠" else ""} · CPU")
-                broadcastRaw("READY:${model.displayName} (CPU, ctx=$nCtx, batch=$nBatch)")
-                Log.d(TAG, "모델 로드 완료: ${model.displayName} | CPU | ctx=$nCtx batch=$nBatch ubatch=$nUbatch threads=$nThreads")
+                updateNotif("${model.displayName}${if (model.supportsThinking && thinkingEnabled) " 🧠" else ""} · $backendLabel")
+                broadcastRaw("READY:${model.displayName}|$backendLabel")
+                Log.d(TAG, "모델 로드 완료: ${model.displayName} | $backendLabel | ctx=$nCtx batch=$nBatch ubatch=$nUbatch threads=$nThreads")
 
                 afterLoad?.invoke()
 
@@ -259,10 +266,16 @@ class AIInferenceService : Service() {
     }
 
     private fun buildSystemPrompt(ctxJson: String): String = buildString {
-        appendLine("You are an expert AI coding assistant inside a mobile IDE called Aicode Studio.")
-        appendLine("Respond in the same language the user is using. If the user writes in Korean, respond in Korean.")
+        appendLine("You are an expert AI coding assistant embedded in Aicode Studio, a mobile Android IDE.")
+        appendLine("Respond in the same language as the user (Korean if they write Korean).")
+        appendLine()
+        appendLine("## File Operations")
+        appendLine("You can operate on project files by outputting a JSON block (omit unused keys):")
+        appendLine("""{"thought":"plan...","updates":[{"path":"rel/path","content":"full content"}],"patch":{"path":"file","old":"exact string","new":"replacement"},"read_range":{"path":"file","start":1,"end":50},"grep":{"path":".","pattern":"regex","recursive":true},"deletes":["path"]}""")
+        appendLine("Rules: paths are relative to project root. 'patch' old= must be exact match incl. whitespace.")
         if (ctxJson.isNotBlank()) {
-            appendLine("Context from memory:")
+            appendLine()
+            appendLine("## Project Context")
             appendLine(ctxJson)
         }
     }.trim()
@@ -362,6 +375,24 @@ class AIInferenceService : Service() {
 
     private fun setState(s: State) {
         state = s
+        // 생성/로드 중에만 포그라운드 유지; 대기/유휴 시엔 포그라운드 해제
+        when (s) {
+            State.GENERATING, State.LOADING -> {
+                val text = when (s) {
+                    State.LOADING    -> "${activeModel?.displayName ?: "AI"} 로드 중…"
+                    else             -> "${activeModel?.displayName ?: "AI"} 생성 중…"
+                }
+                startForeground(InferenceConfig.NOTIF_ID, buildNotif(text))
+            }
+            else -> {
+                @Suppress("DEPRECATION")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    stopForeground(true)
+                }
+            }
+        }
         sendBroadcast(Intent(BROADCAST_STATUS).apply {
             putExtra(EXTRA_STATUS, s.name)
             setPackage(packageName)

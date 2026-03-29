@@ -215,9 +215,9 @@ object HardwareAnalyzer {
     }
 
     private fun isBuggyVulkan(soc: String, renderer: String): Boolean {
-        // Adreno 830 (Snapdragon 8 Elite) Vulkan backend has issues in some llama.cpp builds
-        if (soc.lowercase().contains("8650") || soc.lowercase().contains("8 elite") || 
-            renderer.lowercase().contains("830")) return true
+        // Vulkan crash protection is now handled at the JNI layer (safe_backend_init with
+        // sigsetjmp/siglongjmp).  No devices are pre-blocked here; the native layer will
+        // auto-detect and fall back to CPU if the driver crashes.
         return false
     }
 

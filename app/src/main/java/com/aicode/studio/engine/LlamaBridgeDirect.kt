@@ -13,11 +13,13 @@ package com.aicode.studio.engine
 object LlamaBridgeDirect {
 
     init {
-        // Load in dependency order: transitive deps → llama → our JNI bridge
-        // Android 6+ auto-loads DT_NEEDED, but explicit ordering avoids edge cases
+        // Load in dependency order: transitive deps → llama → our JNI bridge.
+        // ggml-vulkan must be loaded BEFORE llama so the backend can auto-register.
+        // Android 6+ auto-loads DT_NEEDED, but explicit ordering avoids edge cases.
         runCatching { System.loadLibrary("omp") }
         System.loadLibrary("ggml-base")
         System.loadLibrary("ggml-cpu")
+        runCatching { System.loadLibrary("ggml-vulkan") }  // optional; crash-safe via JNI signal handler
         System.loadLibrary("ggml")
         System.loadLibrary("llama")
         System.loadLibrary("llama_direct")
@@ -60,4 +62,11 @@ object LlamaBridgeDirect {
 
     /** Free context and model. Must be called from the native executor thread. */
     external fun nativeShutdown()
+
+    /**
+     * Returns true if Vulkan backend initialised successfully.
+     * Only meaningful after [nativeInit] has been called at least once.
+     * Returns false if Vulkan crashed during init (auto-fallback to CPU).
+     */
+    external fun nativeIsGpuAvailable(): Boolean
 }

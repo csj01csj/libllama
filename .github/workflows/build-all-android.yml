@@ -1,0 +1,371 @@
+name: Build all llama.cpp .so (Android arm64-v8a, Vulkan)
+
+# Strategy:
+#   1. Clone llamatik v0.18.0 AAR → extract prebuilt .so + llama.h (no build needed)
+#   2. Find the llama.cpp git ref embedded in llamatik 0.18.0
+#   3. Build libggml-vulkan.so from that exact ref (ABI-matched)
+#   4. Upload: all .so from AAR + new libggml-vulkan.so + llama.h
+#
+# Why extract from AAR first:
+#   llamatik ships arm64-v8a .so files pre-compiled → libllama.so, libggml.so,
+#   libggml-base.so, libggml-cpu.so, libomp.so are taken directly.
+#   Only libggml-vulkan.so needs to be built (not shipped in AAR).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-all-android.yml'
+
+jobs:
+  build-all:
+    runs-on: ubuntu-22.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      LLAMATIK_VERSION: "0.18.0"
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. System deps ───────────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build git python3 pkg-config unzip wget
+
+      # ── 3. Android NDK r27c ──────────────────────────────────────────────────
+      - name: Setup Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Export NDK env vars and add glslc to PATH
+        run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK=$NDK_PATH"      >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+          echo "$NDK_PATH/shader-tools/linux-x86_64" >> $GITHUB_PATH
+
+      # ── 4. Download llamatik 0.18.0 AAR and extract .so + llama.h ────────────
+      - name: Download llamatik ${{ env.LLAMATIK_VERSION }} AAR
+        run: |
+          set -euo pipefail
+          # Try GitHub Releases first, then Maven Central / JitPack
+          AAR_URL="https://github.com/ferranpons/Llamatik/releases/download/v${LLAMATIK_VERSION}/llamatik-${LLAMATIK_VERSION}.aar"
+          MAVEN_URL="https://repo1.maven.org/maven2/com/github/ferranpons/llamatik/${LLAMATIK_VERSION}/llamatik-${LLAMATIK_VERSION}.aar"
+          JITPACK_URL="https://jitpack.io/com/github/ferranpons/Llamatik/${LLAMATIK_VERSION}/Llamatik-${LLAMATIK_VERSION}.aar"
+
+          for URL in "$AAR_URL" "$MAVEN_URL" "$JITPACK_URL"; do
+            echo "Trying: $URL"
+            if wget -q --spider "$URL" 2>/dev/null; then
+              wget -q -O llamatik.aar "$URL" && echo "Downloaded from $URL" && break
+            fi
+          done
+
+          [ -f llamatik.aar ] || {
+            echo "AAR not found via direct URL — cloning repo and building AAR"
+            git clone --depth=1 --branch "v${LLAMATIK_VERSION}" \
+              https://github.com/ferranpons/Llamatik.git llamatik_repo \
+            || git clone --depth=1 --branch "${LLAMATIK_VERSION}" \
+              https://github.com/ferranpons/Llamatik.git llamatik_repo
+            cd llamatik_repo
+            # Try to find pre-built AAR in repo
+            AAR=$(find . -name "*.aar" | head -1 || true)
+            if [ -n "$AAR" ]; then
+              cp "$AAR" ../llamatik.aar
+            else
+              echo "No AAR in repo — will build from source later"
+              touch ../no_aar
+            fi
+            cd ..
+          }
+
+      - name: Extract .so and llama.h from AAR
+        id: extract_aar
+        run: |
+          set -euo pipefail
+          mkdir -p aar_extract output/arm64-v8a
+
+          if [ -f llamatik.aar ] && [ ! -f no_aar ]; then
+            echo "Extracting from AAR..."
+            unzip -q llamatik.aar -d aar_extract
+
+            echo "=== AAR contents ==="
+            find aar_extract -type f | sort | head -40
+
+            # Copy arm64-v8a .so files
+            SO_DIR=$(find aar_extract -path "*/arm64-v8a" -type d | head -1 || true)
+            if [ -n "$SO_DIR" ]; then
+              cp "$SO_DIR"/*.so output/arm64-v8a/ 2>/dev/null || true
+              echo "Copied .so from $SO_DIR:"
+              ls -lh output/arm64-v8a/
+            fi
+
+            # Find llama.h (may be in jni/include or headers/)
+            LLAMA_H=$(find aar_extract -name "llama.h" | head -1 || true)
+            if [ -n "$LLAMA_H" ]; then
+              cp "$LLAMA_H" output/
+              echo "Copied llama.h from AAR"
+            else
+              echo "llama.h not in AAR — will copy from source later"
+            fi
+
+            echo "aar_extracted=true" >> $GITHUB_OUTPUT
+          else
+            echo "No AAR available — all .so will be built from source"
+            echo "aar_extracted=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 5. Find llama.cpp ref from llamatik ──────────────────────────────────
+      - name: Clone llamatik ${{ env.LLAMATIK_VERSION }} (for llama.cpp ref)
+        if: steps.extract_aar.outputs.aar_extracted != 'true'
+        run: |
+          [ -d llamatik_repo ] || \
+            git clone --depth=1 --branch "v${LLAMATIK_VERSION}" \
+              https://github.com/ferranpons/Llamatik.git llamatik_repo \
+          || git clone --depth=1 --branch "${LLAMATIK_VERSION}" \
+              https://github.com/ferranpons/Llamatik.git llamatik_repo
+
+      - name: Always clone llamatik for llama.cpp ref detection
+        run: |
+          [ -d llamatik_repo ] && echo "Already cloned" && exit 0
+          git clone --depth=1 --branch "v${LLAMATIK_VERSION}" \
+            https://github.com/ferranpons/Llamatik.git llamatik_repo \
+          || git clone --depth=1 --branch "${LLAMATIK_VERSION}" \
+            https://github.com/ferranpons/Llamatik.git llamatik_repo \
+          || git clone --depth=1 \
+            https://github.com/ferranpons/Llamatik.git llamatik_repo
+
+      - name: Extract llama.cpp git ref from llamatik
+        id: llama_ref
+        run: |
+          set -euo pipefail
+
+          # Try submodule approach
+          SUBMODULE_DIR=$(find llamatik_repo -maxdepth 4 \
+            \( -name "llama.cpp" -o -path "*/ggml-org/llama*" \) -type d | head -1 || true)
+
+          if [ -n "$SUBMODULE_DIR" ] && [ -f "$SUBMODULE_DIR/CMakeLists.txt" ]; then
+            REF=$(git -C llamatik_repo submodule status 2>/dev/null \
+              | grep "$(basename $SUBMODULE_DIR)" | awk '{print $1}' | tr -d '-+' || true)
+            if [ -n "$REF" ]; then
+              echo "llama_ref=$REF" >> $GITHUB_OUTPUT
+              echo "Submodule commit: $REF"
+              exit 0
+            fi
+          fi
+
+          # Try FetchContent / GIT_TAG in CMakeLists
+          CMAKE_FILE=$(find llamatik_repo -name "CMakeLists.txt" \
+            | xargs grep -l "llama\.cpp\|ggml-org\|GIT_REPOSITORY" 2>/dev/null \
+            | head -1 || true)
+
+          if [ -n "$CMAKE_FILE" ]; then
+            REF=$(grep -A5 "GIT_REPOSITORY" "$CMAKE_FILE" \
+              | grep "GIT_TAG" \
+              | grep -oP '(?<=GIT_TAG\s{0,10})[^\s)]+' \
+              | head -1 || true)
+            echo "CMakeLists GIT_TAG: ${REF:-not found}"
+          fi
+
+          if [ -z "${REF:-}" ]; then
+            # Try gradle files
+            REF=$(grep -r "llama\|b[0-9]\{4\}" llamatik_repo \
+              --include="*.gradle" --include="*.kts" \
+              | grep -oP 'b[0-9]{4,5}' | head -1 || true)
+            echo "Gradle ref: ${REF:-not found}"
+          fi
+
+          if [ -z "${REF:-}" ]; then
+            # Fallback: use latest llama.cpp main
+            REF="master"
+            echo "WARNING: Could not detect llama.cpp version, using $REF"
+          fi
+
+          echo "llama_ref=$REF" >> $GITHUB_OUTPUT
+          echo "Using llama.cpp ref: $REF"
+
+      # ── 6. Clone llama.cpp ───────────────────────────────────────────────────
+      - name: Clone llama.cpp at detected ref
+        run: |
+          set -euo pipefail
+          REF="${{ steps.llama_ref.outputs.llama_ref }}"
+          echo "Cloning llama.cpp at: $REF"
+
+          git clone --depth=1 --branch "$REF" \
+            https://github.com/ggml-org/llama.cpp.git llama_cpp_src \
+          || {
+            git clone --depth=1 \
+              https://github.com/ggml-org/llama.cpp.git llama_cpp_src
+            git -C llama_cpp_src checkout "$REF" || true
+          }
+
+          echo "llama.cpp HEAD: $(git -C llama_cpp_src rev-parse HEAD 2>/dev/null || echo unknown)"
+
+          # Copy llama.h if not already from AAR
+          [ -f output/llama.h ] && echo "llama.h already from AAR" || {
+            LLAMA_H=$(find llama_cpp_src -name "llama.h" -not -path "*/test*" | head -1 || true)
+            [ -n "$LLAMA_H" ] && cp "$LLAMA_H" output/ && echo "Copied llama.h from source"
+          }
+
+      # ── 7. Install LunarG Vulkan SDK ─────────────────────────────────────────
+      - name: Install LunarG Vulkan SDK 1.3.296
+        run: |
+          set -euo pipefail
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-jammy.list \
+            https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-jammy.list
+          sudo apt-get update -qq
+          sudo apt-get install -y vulkan-sdk
+          grep "define VK_HEADER_VERSION " /usr/include/vulkan/vulkan_core.h | grep -v COMPLETE
+
+      # ── 8. Inject Vulkan headers ─────────────────────────────────────────────
+      - name: Inject Vulkan headers into llama.cpp source
+        run: |
+          set -euo pipefail
+          # Detect include dir (layout changed in newer llama.cpp)
+          for D in llama_cpp_src/ggml/include llama_cpp_src/include llama_cpp_src; do
+            [ -d "$D" ] && INCLUDE_DIR="$D" && break
+          done
+          echo "Using INCLUDE_DIR=$INCLUDE_DIR"
+
+          mkdir -p "$INCLUDE_DIR/vulkan"
+          cp -r /usr/include/vulkan/. "$INCLUDE_DIR/vulkan/"
+          [ -d /usr/include/vk_video ] && cp -r /usr/include/vk_video "$INCLUDE_DIR/" || true
+
+          if [ ! -f "$INCLUDE_DIR/vulkan/vulkan.hpp" ]; then
+            git clone --depth=1 --branch v1.3.296 \
+              https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vkhpp 2>/dev/null \
+            || git clone --depth=1 https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vkhpp
+            HPP=$(find /tmp/vkhpp -name "vulkan.hpp" | head -1)
+            [ -n "$HPP" ] && cp "$HPP" "$INCLUDE_DIR/vulkan/" \
+              || { echo "ERROR: vulkan.hpp not found"; exit 1; }
+          fi
+
+          if [ ! -d "$INCLUDE_DIR/vk_video" ]; then
+            git clone --depth=1 \
+              https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vkheaders
+            cp -r /tmp/vkheaders/include/vk_video "$INCLUDE_DIR/"
+          fi
+
+          test -f "$INCLUDE_DIR/vulkan/vulkan.hpp" || { echo "ERROR: vulkan.hpp missing"; exit 1; }
+          test -d "$INCLUDE_DIR/vk_video"          || { echo "ERROR: vk_video/ missing"; exit 1; }
+          echo "INCLUDE_DIR=$INCLUDE_DIR" >> $GITHUB_ENV
+
+      # ── 9. Verify glslc ──────────────────────────────────────────────────────
+      - name: Verify glslc
+        run: glslc --version
+
+      # ── 10. CMake configure ──────────────────────────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -S llama_cpp_src -B build_out \
+            -GNinja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DGGML_VULKAN=ON \
+            -DGGML_VULKAN_COOPMAT=OFF \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Strip COOPMAT_GLSLC_SUPPORT from build.ninja
+        run: |
+          sed -i 's/-DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT//g' build_out/build.ninja
+          echo "Remaining: $(grep -c COOPMAT_GLSLC_SUPPORT build_out/build.ninja || echo 0)"
+
+      # ── 11. Build ────────────────────────────────────────────────────────────
+      - name: Build (full or vulkan-only if AAR .so already present)
+        run: |
+          # If we already have the other .so from AAR, only need ggml-vulkan
+          if ls output/arm64-v8a/libllama.so 2>/dev/null; then
+            echo "libllama.so already from AAR — building only ggml-vulkan target"
+            cmake --build build_out --target ggml-vulkan -j$(nproc) \
+            || cmake --build build_out --target ggml_vulkan -j$(nproc) \
+            || cmake --build build_out -j$(nproc)
+          else
+            echo "No AAR .so available — building everything"
+            cmake --build build_out -j$(nproc)
+          fi
+
+          echo "=== Built .so files ==="
+          find build_out -name "*.so" | sort
+
+      # ── 12. Collect all artifacts ────────────────────────────────────────────
+      - name: Collect final artifact set
+        run: |
+          set -euo pipefail
+          mkdir -p output/arm64-v8a
+
+          # Always copy newly-built libggml-vulkan.so (overrides AAR version if any)
+          VK_SO=$(find build_out -name "libggml-vulkan.so" | head -1 || true)
+          if [ -n "$VK_SO" ]; then
+            cp "$VK_SO" output/arm64-v8a/libggml-vulkan.so
+            echo "libggml-vulkan.so: $(du -sh "$VK_SO" | cut -f1)"
+          fi
+
+          # Fill in any .so not already present (from full build if AAR failed)
+          for LIB in libllama.so libggml.so libggml-base.so libggml-cpu.so libomp.so; do
+            [ -f "output/arm64-v8a/$LIB" ] && continue
+            SRC=$(find build_out -name "$LIB" | head -1 || true)
+            [ -n "$SRC" ] && cp "$SRC" "output/arm64-v8a/$LIB" && echo "Built: $LIB"
+          done
+
+          echo "=== Final output ==="
+          ls -lh output/arm64-v8a/
+          [ -f output/llama.h ] && echo "llama.h: $(wc -l < output/llama.h) lines"
+
+          # Verify mandatory .so
+          for LIB in libllama.so libggml.so libggml-base.so libggml-cpu.so libggml-vulkan.so; do
+            test -f "output/arm64-v8a/$LIB" \
+              && echo "  OK  $LIB" \
+              || { echo "FATAL: missing $LIB"; exit 1; }
+          done
+          echo "All required .so present"
+
+          for SO in output/arm64-v8a/*.so; do
+            file "$SO"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-libs-android-arm64-v8a
+          path: output/
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── 13. GitHub Release (manual trigger only) ─────────────────────────────
+      - name: Create Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llamatik-${{ env.LLAMATIK_VERSION }}-build-${{ github.run_number }}
+          name: "llamatik ${{ env.LLAMATIK_VERSION }} — Android arm64-v8a Vulkan — build #${{ github.run_number }}"
+          body: |
+            All llama.cpp `.so` files for Android arm64-v8a with Vulkan support.
+            Based on **llamatik `${{ env.LLAMATIK_VERSION }}`** (llama.cpp ref: `${{ steps.llama_ref.outputs.llama_ref }}`).
+
+            **Fixes:** Adreno 830 (Snapdragon 8 Elite / S25+) Vulkan GPU crash.
+
+            **Installation:**
+            1. Replace `app/src/main/jniLibs/arm64-v8a/*.so` with files from `arm64-v8a/`
+            2. Replace `app/src/main/cpp/llama.h` with `llama.h`
+            3. Rebuild app in Android Studio
+
+            If `llama.h` API changed: share compile errors → fix `llama_direct_jni.cpp` accordingly.
+          files: |
+            output/arm64-v8a/*.so
+            output/llama.h
+          draft: false
+          prerelease: false
