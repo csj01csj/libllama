@@ -249,21 +249,38 @@ jobs:
               with open(target, 'r') as f: content = f.read()
 
               # 1. Define AUS Sync Helper (Robust Submission)
+              # Place it after ggml_vulkan_context is defined
               if 'void vk_aus_sync' not in content:
-                  sync_func = """
-          static void vk_aus_sync(ggml_vk_context * ctx) {
+                  # Detect context name (older llama.cpp used vk_context or ggml_vulkan_context)
+                  ctx_type = 'ggml_vulkan_context'
+                  if 'struct ggml_vulkan_context' not in content:
+                      if 'struct vk_context' in content: ctx_type = 'vk_context'
+                      else:
+                          # Fallback to searching for the first struct ending in _context
+                          m = re.search(r'struct\s+([a-zA-Z0-9_]*context)', content)
+                          if m: ctx_type = m.group(1)
+
+                  sync_func = f"""
+          static void vk_aus_sync({ctx_type} * ctx) {{
               if (ctx->device->name.find("Adreno") == std::string::npos) return;
               vkEndCommandBuffer(ctx->cur_cb->cb);
-              VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr };
+              VkSubmitInfo si = {{ VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr }};
               vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);
               vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000);
               vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence);
               vkResetCommandBuffer(ctx->cur_cb->cb, 0);
-              VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr };
+              VkCommandBufferBeginInfo bi = {{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr }};
               vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);
-          }
+          }}
           """
-                  content = content.replace('#include', sync_func + '\n#include', 1)
+                  # Insert after the context struct definition to ensure types are known
+                  struct_pos = content.find(f'struct {ctx_type}')
+                  if struct_pos != -1:
+                      end_struct = content.find('};', struct_pos) + 2
+                      content = content[:end_struct] + "\n" + sync_func + content[end_struct:]
+                  else:
+                      # Fallback: after includes
+                      content = content.replace('#include', sync_func + '\n#include', 1)
 
               # 2. Adreno Safe Mode Detection
               content = content.replace('device->name = props.deviceName;', 
