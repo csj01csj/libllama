@@ -82,7 +82,23 @@ $tree
 
     // ─── Tree Builder ─────────────────────────────
 
-    private fun buildTree(root: File, prefix: String = "", depth: Int = 0): String {
+    /** 로컬 AI용 경량 컨텍스트: 파일 트리 + 가장 관련성 높은 파일 1개 내용 (토큰 예산 절약) */
+    fun buildLocalContext(root: File, command: String, maxCharsCtx: Int = 800): String {
+        val tree = buildTree(root)
+        val sb = StringBuilder("## Project Files\n```\n${tree.take(600)}\n```")
+        val all = collectFiles(root)
+        val cmdLow = command.lowercase()
+        val top = all.map { it to score(it, cmdLow) }.filter { it.second > 0 }
+            .maxByOrNull { it.second }?.first
+        if (top != null && sb.length < maxCharsCtx) {
+            val rel = top.relativeTo(root).path
+            val content = top.readText().take(maxCharsCtx - sb.length - 60)
+            sb.append("\n\n## Key File: $rel\n```\n$content\n```")
+        }
+        return sb.toString()
+    }
+
+    internal fun buildTree(root: File, prefix: String = "", depth: Int = 0): String {
         if (depth > 5) return "${prefix}...\n"
         val sb = StringBuilder()
         val kids = root.listFiles()

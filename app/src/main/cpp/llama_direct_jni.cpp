@@ -17,6 +17,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <stdexcept>
+#include <exception>
 #include <setjmp.h>
 #include <signal.h>
 
@@ -34,6 +36,8 @@ static struct llama_context      *g_ctx             = nullptr;
 static std::atomic<bool>          g_stop            {false};
 static bool                       g_backend_inited  = false;
 static bool                       g_vulkan_available = false;
+static bool                       g_need_backend_reinit = false; // set after GPU_DEVICE_LOST
+static int                        g_gpu_device_lost_count = 0;  // incremented on each GPU_DEVICE_LOST
 
 /* ── Vulkan crash-protection state ───────────────────────────────────────────── */
 static sigjmp_buf                     g_vk_init_jmp;
@@ -75,13 +79,19 @@ static void safe_backend_init() {
     int crash_sig = sigsetjmp(g_vk_init_jmp, 1);
 
     if (crash_sig == 0) {
-        /* Normal path — Vulkan not disabled, attempt GPU init */
+        /* Normal path — Vulkan not disabled, attempt GPU init.
+         * Disable FP16 storage: Adreno 830 f16 matmul shaders can produce
+         * ErrorDeviceLost; FP32 path is slower but stable. */
+        setenv("GGML_VK_DISABLE_F16", "1", 0);  /* 0 = don't override if already set */
         llama_backend_init();
         g_in_vk_init = 0;
         sigaction(SIGSEGV, &g_saved_sigsegv, nullptr);
         sigaction(SIGBUS,  &g_saved_sigbus,  nullptr);
-        g_vulkan_available = true;
-        LOGI("llama_backend_init() OK — Vulkan available");
+        /* Only mark Vulkan available if it wasn't explicitly disabled */
+        g_vulkan_available = (getenv("GGML_VK_DISABLE") == nullptr);
+        LOGI("llama_backend_init() OK — Vulkan=%s DISABLE_F16=%s",
+             g_vulkan_available ? "YES" : "DISABLED",
+             getenv("GGML_VK_DISABLE_F16") ? "YES" : "NO");
     } else {
         /* Crash caught via signal handler */
         LOGW("llama_backend_init() crashed (signal %d, likely Vulkan driver bug) "
@@ -183,8 +193,47 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
         jint n_ctx, jint n_batch, jint n_ubatch,
         jint n_gpu_layers, jint n_threads)
 {
-    /* Initialise ggml backends (signal-protected; auto-falls back to CPU if
-     * Vulkan driver crashes).  Guard prevents double-init across model reloads. */
+    /* Tear down any existing session.
+     *
+     * After GPU_DEVICE_LOST, g_need_backend_reinit is set and g_ctx/g_model may
+     * hold Vulkan-backed resources on a lost device.  Attempting llama_free() on
+     * a lost VkDevice triggers further Vulkan calls → more ErrorDeviceLost → the
+     * GGML backend registry ends up with a zombie Vulkan entry that poisons even
+     * CPU-only contexts afterwards.
+     *
+     * Safe strategy: null out the pointers WITHOUT freeing (accept the one-time
+     * memory leak for this session).  The leaked Vulkan buffers are on a lost
+     * device anyway — the OS will reclaim them when the process exits.
+     * Normal (non-DeviceLost) reloads still free cleanly. */
+    if (g_need_backend_reinit) {
+        /* GPU_DEVICE_LOST recovery path.
+         *
+         * Step 1: null out (leak) the broken GPU context/model without freeing.
+         * Calling llama_free(g_ctx) on a lost-device context triggers further
+         * Vulkan API calls → exceptions / undefined behaviour. Accept the leak. */
+        g_ctx   = nullptr;
+        g_model = nullptr;
+        g_vocab = nullptr;
+        g_need_backend_reinit = false;
+
+        /* Step 2: deregister the broken Vulkan backend.
+         * Now that g_ctx / g_model are null, llama_backend_free() only needs to
+         * destroy the VkDevice / VkInstance — which is safe on a lost device per
+         * Vulkan spec (vkDestroyDevice is valid even after device loss). */
+        LOGI("Deregistering broken Vulkan backend via llama_backend_free()");
+        try { llama_backend_free(); } catch (...) {
+            LOGW("llama_backend_free() threw during device-lost recovery (ignored)");
+        }
+        g_backend_inited = false;
+        /* safe_backend_init() below will re-init with GGML_VK_DISABLE=1 already
+         * in the environment → clean CPU-only backend, no Vulkan entry in GGML's
+         * scheduler → CPU-only llama_decode will never reach the lost device. */
+    } else {
+        if (g_ctx)   { llama_free(g_ctx);         g_ctx   = nullptr; }
+        if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+        g_vocab = nullptr;
+    }
+
     if (!g_backend_inited) {
         safe_backend_init();
         g_backend_inited = true;
@@ -197,11 +246,6 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
         LOGW("GPU layers requested (%d) but Vulkan unavailable — using CPU only",
              (int)n_gpu_layers);
     }
-
-    /* Tear down any existing session */
-    if (g_ctx)   { llama_free(g_ctx);         g_ctx   = nullptr; }
-    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
-    g_vocab = nullptr;
 
     const char *model_path = env->GetStringUTFChars(j_model_path, nullptr);
     LOGI("Loading model: %s  ctx=%d batch=%d ubatch=%d gpu_layers=%d (requested=%d) threads=%d",
@@ -253,8 +297,21 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
     cparams.n_threads      = (int32_t)n_threads;
     cparams.n_threads_batch = (int32_t)n_threads;
 
-    LOGI("Creating context: n_ctx=%u n_batch=%u n_ubatch=%u n_threads=%d",
-         cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_threads);
+    /* Disable Flash Attention for GPU (Vulkan) contexts.
+     *
+     * Adreno 830 (SM8750) switched to Immediate Mode Rendering — a new GPU
+     * architecture where subgroup shuffle/ballot operations used by the Vulkan
+     * Flash Attention kernel can cause ErrorDeviceLost.  Standard attention
+     * uses simpler matrix ops and is stable on this device.
+     * CPU contexts keep the default (AUTO) for best performance. */
+    if (effective_gpu_layers > 0) {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        LOGI("Flash Attention DISABLED for GPU context (Adreno 830 IMR workaround)");
+    }
+
+    LOGI("Creating context: n_ctx=%u n_batch=%u n_ubatch=%u n_threads=%d flash_attn=%s",
+         cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_threads,
+         (cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) ? "OFF" : "AUTO");
 
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
@@ -277,6 +334,16 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeIsGpuAvailable(
         JNIEnv * /*env*/, jclass /*clazz*/)
 {
     return g_vulkan_available ? JNI_TRUE : JNI_FALSE;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  nativeGetGpuLostCount() – number of GPU_DEVICE_LOST events so far
+ * ───────────────────────────────────────────────────────────────────────────── */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeGetGpuLostCount(
+        JNIEnv * /*env*/, jclass /*clazz*/)
+{
+    return (jint)g_gpu_device_lost_count;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -400,7 +467,28 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeGenerate(
             batch.seq_id[i][0] = 0;
             batch.logits[i]    = (i == n_prompt_tokens - 1) ? 1 : 0;
         }
-        int ret = llama_decode(g_ctx, batch);
+        int ret = -1;
+        try {
+            ret = llama_decode(g_ctx, batch);
+        } catch (const std::exception& ex) {
+            llama_batch_free(batch);
+            ++g_gpu_device_lost_count;
+            LOGE("llama_decode (prefill) threw: %s — DeviceLost #%d", ex.what(), g_gpu_device_lost_count);
+            g_vulkan_available = false;
+            setenv("GGML_VK_DISABLE", "1", 1);
+            g_need_backend_reinit = true;
+            callback_error(env, callback, "GPU_DEVICE_LOST");
+            return;
+        } catch (...) {
+            llama_batch_free(batch);
+            ++g_gpu_device_lost_count;
+            LOGE("llama_decode (prefill) threw unknown — DeviceLost #%d", g_gpu_device_lost_count);
+            g_vulkan_available = false;
+            setenv("GGML_VK_DISABLE", "1", 1);
+            g_need_backend_reinit = true;
+            callback_error(env, callback, "GPU_DEVICE_LOST");
+            return;
+        }
         llama_batch_free(batch);
         if (ret != 0) {
             LOGE("llama_decode (prefill) failed: %d", ret);
@@ -500,7 +588,30 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeGenerate(
         step_batch.seq_id[0][0] = 0;
         step_batch.logits[0]    = 1;
 
-        int ret = llama_decode(g_ctx, step_batch);
+        int ret = -1;
+        try {
+            ret = llama_decode(g_ctx, step_batch);
+        } catch (const std::exception& ex) {
+            llama_batch_free(step_batch);
+            ++g_gpu_device_lost_count;
+            LOGE("llama_decode (step %d) threw: %s — DeviceLost #%d", n_generated, ex.what(), g_gpu_device_lost_count);
+            llama_sampler_free(sampler);
+            g_vulkan_available = false;
+            setenv("GGML_VK_DISABLE", "1", 1);
+            g_need_backend_reinit = true;
+            callback_error(env, callback, "GPU_DEVICE_LOST");
+            return;
+        } catch (...) {
+            llama_batch_free(step_batch);
+            ++g_gpu_device_lost_count;
+            LOGE("llama_decode (step %d) threw unknown — DeviceLost #%d", n_generated, g_gpu_device_lost_count);
+            llama_sampler_free(sampler);
+            g_vulkan_available = false;
+            setenv("GGML_VK_DISABLE", "1", 1);
+            g_need_backend_reinit = true;
+            callback_error(env, callback, "GPU_DEVICE_LOST");
+            return;
+        }
         llama_batch_free(step_batch);
         if (ret != 0) {
             LOGE("llama_decode (step %d) failed: %d", n_generated, ret);

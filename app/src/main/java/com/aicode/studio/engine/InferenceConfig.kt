@@ -46,7 +46,8 @@ object InferenceConfig {
         val minRamGb        : Int,
         val supportsThinking: Boolean,
         val downloadUrl     : String,
-        val fileName        : String
+        val fileName        : String,
+        val gpuLayers       : Int = 99
     )
 
     val ALL_MODELS = listOf(
@@ -130,6 +131,19 @@ object InferenceConfig {
             supportsThinking = true,
             downloadUrl      = "$HF/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
             fileName         = "qwen3_4b_q4_k_m.gguf"
+        ),
+
+        // ── Gemma 3 시리즈 ────────────────────────────────────────────────────
+        ModelDef(
+            id               = "gemma3_4b",
+            displayName      = "Gemma 3 4B",
+            series           = "Gemma 3",
+            paramsBillion    = 4.0f,
+            downloadSizeGb   = 2.5f,
+            minRamGb         = 4,
+            supportsThinking = false,
+            downloadUrl      = "$HF/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf",
+            fileName         = "gemma3_4b_q4_k_m.gguf"
         )
     )
 }

@@ -69,4 +69,10 @@ object LlamaBridgeDirect {
      * Returns false if Vulkan crashed during init (auto-fallback to CPU).
      */
     external fun nativeIsGpuAvailable(): Boolean
+
+    /**
+     * Returns the number of GPU_DEVICE_LOST events since process start.
+     * Used by AIInferenceService to decide how many GPU layers to attempt.
+     */
+    external fun nativeGetGpuLostCount(): Int
 }

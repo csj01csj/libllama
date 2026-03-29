@@ -137,6 +137,7 @@
 
         <!-- ── STATUS / AI STATUS ── -->
         <LinearLayout
+            android:id="@+id/statusRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="#1A1A1A"
@@ -155,12 +156,33 @@
                 android:singleLine="true" />
 
             <TextView
+                android:id="@+id/tvLocalAIMode"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#888"
+                android:textSize="10sp"
+                android:layout_marginEnd="8dp"
+                android:visibility="gone" />
+
+            <TextView
                 android:id="@+id/tvCursorPos"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Ln 1, Col 1"
                 android:textColor="#666"
                 android:textSize="10sp" />
+
+            <!-- 로그 패널 닫힌 상태에서 여는 버튼 -->
+            <ImageButton
+                android:id="@+id/btnOpenLog"
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:src="@android:drawable/arrow_up_float"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:tint="#666"
+                android:layout_marginStart="4dp"
+                android:visibility="gone" />
         </LinearLayout>
 
         <!-- ── LOG PANEL (접기 가능) ── -->
@@ -278,6 +300,17 @@
                         android:backgroundTint="#2A2A2A"
                         android:textColor="#888"
                         android:layout_marginStart="8dp" />
+
+                    <Button
+                        android:id="@+id/btnThinkingToggle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="30dp"
+                        android:text="Think: ON"
+                        android:textSize="10sp"
+                        android:backgroundTint="#1A3A1A"
+                        android:textColor="#4CAF50"
+                        android:layout_marginStart="6dp"
+                        android:visibility="gone" />
 
                     <View
                         android:layout_width="0dp"

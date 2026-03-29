@@ -36,6 +36,10 @@ class AIInferenceService : Service() {
     private var modelLoaded     : Boolean = false
     private var thinkingEnabled : Boolean = true
     private var pendingCtxJson  : String  = ""
+    private var gpuFailed       : Boolean = false   // set after all GPU tiers exhausted
+    // GPU layer tiers tried in order on ErrorDeviceLost: full → partial → few → CPU-only
+    private val GPU_LAYER_TIERS = listOf(99, 32, 16, 0)
+    private var gpuTierIndex    : Int = 0           // index into GPU_LAYER_TIERS
 
     // ── 대화 기록 (nUbatch=512 제한으로 최대 3턴 / 600자 이내 유지) ──
     private val localHistory   = mutableListOf<Pair<String, String>>()
@@ -151,7 +155,7 @@ class AIInferenceService : Service() {
     //  Model loading
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun loadModel(model: InferenceConfig.ModelDef, afterLoad: (() -> Unit)? = null) {
+    private fun loadModel(model: InferenceConfig.ModelDef, afterLoad: (() -> Unit)? = null, forceCpu: Boolean = false, overrideGpuLayers: Int? = null) {
         if (state == State.LOADING) return
         setState(State.LOADING)
         updateNotif("${model.displayName} 로드 중…")
@@ -165,20 +169,28 @@ class AIInferenceService : Service() {
                 val profile = HardwareAnalyzer.analyze(applicationContext)
                 val ram     = profile.totalRamGb
 
+                // GPU layers: use tier-based step-down on repeated ErrorDeviceLost.
+                // overrideGpuLayers lets the caller specify exact count (used during retry).
+                val nGpuLayers = when {
+                    forceCpu || gpuFailed || !profile.hasVulkan -> 0
+                    overrideGpuLayers != null -> overrideGpuLayers
+                    else -> GPU_LAYER_TIERS[gpuTierIndex.coerceIn(GPU_LAYER_TIERS.indices)]
+                }
+                val useGpu = nGpuLayers > 0
+
                 val nCtx    = when {
                     ram >= 16 -> 4096
                     ram >= 12 -> 2048
                     ram >= 8  -> 1536
                     else      -> 1024
                 }
+                // n_batch  = max tokens per single llama_decode call (must be >= prompt length)
+                // n_ubatch = physical GPU dispatch chunk size (controls per-dispatch memory use)
+                // Keep n_batch = n_ctx so long prompts don't trigger ggml_abort.
+                // For GPU, reduce n_ubatch to 128 so each Vulkan compute dispatch is smaller
+                // — this is the knob that reduces Adreno 830 activation buffer size.
                 val nBatch  = nCtx
-                val nUbatch = nBatch.coerceAtMost(512)
-
-                // GPU layers: attempt Vulkan when the hardware profile recommends it.
-                // The JNI layer (safe_backend_init) will catch any driver crash via
-                // sigsetjmp/siglongjmp and automatically fall back to CPU-only,
-                // so it is safe to pass n_gpu_layers > 0 here unconditionally.
-                val nGpuLayers = if (profile.hasVulkan) 99 else 0
+                val nUbatch = if (useGpu) 128 else nBatch.coerceAtMost(512)
                 val nThreads   = profile.cores.coerceAtMost(8)
 
                 val ret = withContext(nativeContext) {
@@ -205,11 +217,16 @@ class AIInferenceService : Service() {
                 if (!model.supportsThinking) thinkingEnabled = false
 
                 val gpuOk = LlamaBridgeDirect.nativeIsGpuAvailable()
-                val backendLabel = if (gpuOk) "GPU (Vulkan)" else "CPU"
+                val effectiveLayers = nGpuLayers
+                val backendLabel = when {
+                    gpuOk && effectiveLayers >= 99 -> "GPU (Vulkan)"
+                    gpuOk && effectiveLayers > 0   -> "GPU+CPU (${effectiveLayers}L)"
+                    else                           -> "CPU"
+                }
                 setState(State.READY)
                 updateNotif("${model.displayName}${if (model.supportsThinking && thinkingEnabled) " 🧠" else ""} · $backendLabel")
                 broadcastRaw("READY:${model.displayName}|$backendLabel")
-                Log.d(TAG, "모델 로드 완료: ${model.displayName} | $backendLabel | ctx=$nCtx batch=$nBatch ubatch=$nUbatch threads=$nThreads")
+                Log.d(TAG, "모델 로드 완료: ${model.displayName} | $backendLabel | ctx=$nCtx batch=$nBatch ubatch=$nUbatch threads=$nThreads gpu_layers=$effectiveLayers")
 
                 afterLoad?.invoke()
 
@@ -334,10 +351,37 @@ class AIInferenceService : Service() {
                                     updateNotif("${model.displayName} 대기 중")
                                 }
                                 override fun onError(error: String) {
-                                    Log.e(TAG, "네이티브 엔진 에러: $error")
-                                    broadcastRaw("ERROR:$error")
-                                    setState(State.READY)
-                                    updateNotif("오류: $error")
+                                    if (error == "GPU_DEVICE_LOST") {
+                                        gpuTierIndex++
+                                        val nextLayers = GPU_LAYER_TIERS.getOrNull(gpuTierIndex) ?: 0
+                                        modelLoaded = false
+                                        val savedInput = lastUserInput
+                                        val toLoad = activeModel ?: run {
+                                            broadcastRaw("ERROR:GPU 실패 후 모델 없음")
+                                            setState(State.READY)
+                                            return
+                                        }
+                                        if (nextLayers == 0) {
+                                            // All GPU tiers exhausted — fall back to CPU permanently
+                                            gpuFailed = true
+                                            Log.w(TAG, "All GPU tiers exhausted — CPU-only mode")
+                                            broadcastRaw("GPU_FALLBACK:GPU 실패, CPU 모드로 전환 중… 잠시 후 다시 질문해주세요")
+                                            setState(State.READY)
+                                            loadModel(toLoad, forceCpu = true)
+                                        } else {
+                                            // Step down to fewer GPU layers and auto-retry
+                                            Log.w(TAG, "GPU_DEVICE_LOST — stepping down to $nextLayers GPU layers, retrying")
+                                            broadcastRaw("GPU_FALLBACK:GPU 레이어 감소 ($nextLayers) 재시도 중…")
+                                            loadModel(toLoad,
+                                                afterLoad = { doGenerate(savedInput) },
+                                                overrideGpuLayers = nextLayers)
+                                        }
+                                    } else {
+                                        Log.e(TAG, "네이티브 엔진 에러: $error")
+                                        broadcastRaw("ERROR:$error")
+                                        setState(State.READY)
+                                        updateNotif("오류: $error")
+                                    }
                                 }
                             }
                         )

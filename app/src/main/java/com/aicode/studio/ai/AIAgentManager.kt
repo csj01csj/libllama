@@ -47,6 +47,7 @@ class AIAgentManager(private val logger: LogManager) {
     // Local AI
     private var localAI: LocalAIManager? = null
     private var localMode = false
+    private var localModelName = "Local AI"
 
     // Memory
     private var memoryMgr: MemoryManager? = null
@@ -69,6 +70,8 @@ class AIAgentManager(private val logger: LogManager) {
         localAI = manager
         localMode = enabled
     }
+
+    fun setLocalModelName(name: String) { localModelName = name }
 
     fun isRunning() = running
 
@@ -97,7 +100,7 @@ class AIAgentManager(private val logger: LogManager) {
 
         // 백그라운드: 메모리 트리밍 → 프롬프트 빌드 → 전송
         Thread {
-            // ── 로컬 AI: 에이전트 프레임워크 우회 ──────────────────────────────
+            // ── 로컬 AI: 경량 에이전트 루프 ────────────────────────────────────
             // Qwen3/Qwen2.5 모델은 non-causal (hybrid chunked) attention 사용.
             // llamatik 기본 n_ubatch=512 이므로 프롬프트 토큰 수가 512를 초과하면
             // "noncausal attention requires n_ubatch >= n_tokens" assertion → ggml_abort 발생.
@@ -106,21 +109,7 @@ class AIAgentManager(private val logger: LogManager) {
                 val local = localAI ?: run { running = false; cb?.onError("Local AI 없음"); return@Thread }
                 // 저장된 대화 기록 주입 (서비스는 매번 덮어씀)
                 local.importHistory(recentLocalHistory())
-                local.setStreamCallback(object : LocalAIManager.StreamCallback {
-                    override fun onToken(token: String) {}
-                    override fun onComplete(fullResponse: String) {
-                        addLocalHistory(command, fullResponse)
-                        saveSession()
-                        running = false
-                        cb?.onCompleted(fullResponse)
-                    }
-                    override fun onError(error: String) {
-                        logger.logError("Local AI Error: $error")
-                        running = false
-                        cb?.onError("Local AI: $error")
-                    }
-                })
-                local.sendPrompt(command)
+                executeLocalAI(local, command, r, 0)
                 return@Thread
             }
 
@@ -254,7 +243,7 @@ class AIAgentManager(private val logger: LogManager) {
             history.put(JSONObject().apply {
                 put("role", "model")
                 put("parts", JSONArray().put(JSONObject().put("text",
-                    "[Result from Local AI]\n$originalText")))
+                    "[Result from Local AI: $localModelName]\n$originalText")))
             })
             saveSession()
         }
@@ -463,8 +452,110 @@ class AIAgentManager(private val logger: LogManager) {
     private fun addLocalHistory(user: String, assistant: String) {
         val clean = assistant.replace(Regex("<think>[\\s\\S]*?</think>\\s*"), "").trim()
         if (clean.isEmpty()) return
-        localConvHistory.add(user.take(200) to clean.take(200))
+        // 소스 태그 포함 (기억 파일에 어떤 AI가 답변했는지 기록)
+        val tagged = "[Local AI: $localModelName] ${clean.take(190)}"
+        localConvHistory.add(user.take(200) to tagged)
         if (localConvHistory.size > 3) localConvHistory.removeAt(0)
+    }
+
+    // ── 로컬 AI 도구 실행 루프 ────────────────────────────────
+    private fun executeLocalAI(local: LocalAIManager, prompt: String, r: File, iteration: Int) {
+        if (iteration >= MAX_ITER) {
+            running = false
+            cb?.onError("Local AI: 최대 반복(${MAX_ITER}) 도달")
+            return
+        }
+
+        // 첫 번째 iteration: 프로젝트 컨텍스트를 서비스에 주입 (시스템 프롬프트에 포함됨)
+        if (iteration == 0) {
+            val ctx = PromptBuilder(800).buildLocalContext(r, prompt)
+            local.setContext(ctx)
+        }
+
+        local.setStreamCallback(object : LocalAIManager.StreamCallback {
+            override fun onToken(token: String) {}
+
+            override fun onComplete(fullResponse: String) {
+                val json = extractJson(fullResponse)
+                if (json == null) {
+                    // 일반 텍스트 응답 — 완료
+                    if (iteration == 0) addLocalHistory(prompt, fullResponse)
+                    saveSession()
+                    running = false
+                    cb?.onCompleted(fullResponse)
+                    return
+                }
+                try {
+                    val result = JSONObject(json)
+                    val thought = result.optString("thought", "")
+                    if (thought.isNotEmpty()) mainHandler { cb?.onThought(thought) }
+
+                    val feedback = mutableListOf<String>()
+                    val grep      = result.optJSONObject("grep")
+                    val readRange = result.optJSONObject("read_range")
+                    val patch     = result.optJSONObject("patch")
+                    val updates   = result.optJSONArray("updates")
+                    val deletes   = result.optJSONArray("deletes")
+
+                    if (grep != null) feedback.add(executeGrep(grep.optString("path","."), grep.optString("pattern",""), grep.optBoolean("recursive",true)))
+                    if (readRange != null) feedback.add(executeReadRange(readRange.optString("path"), readRange.optInt("start",1), readRange.optInt("end",100)))
+                    if (patch != null) feedback.add(executePatch(patch.optString("path"), patch.optString("old"), patch.optString("new")))
+
+                    if (updates != null && updates.length() > 0) {
+                        for (i in 0 until updates.length()) {
+                            val o = updates.getJSONObject(i)
+                            val p = o.getString("path"); val c = o.getString("content")
+                            try {
+                                val f = File(r, p); f.parentFile?.mkdirs(); f.writeText(c)
+                                feedback.add("OK: Wrote $p")
+                                mainHandler { cb?.onFileUpdated(p, true, "완료") }
+                            } catch (e: Exception) { feedback.add("FAIL: $p - ${e.message}") }
+                        }
+                    }
+
+                    if (deletes != null && deletes.length() > 0) {
+                        for (i in 0 until deletes.length()) {
+                            val p = deletes.getString(i)
+                            cb?.onDeleteRequested(p) { ok ->
+                                if (ok) { File(r, p).deleteRecursively(); feedback.add("OK: Deleted $p") }
+                                else feedback.add("REJECTED: $p")
+                                continueLocalAI(local, prompt, r, iteration, feedback)
+                            }
+                        }
+                        return // continueLocalAI called from delete callback
+                    }
+
+                    if (feedback.isNotEmpty()) {
+                        continueLocalAI(local, prompt, r, iteration, feedback)
+                    } else {
+                        // 도구 없음 — 완료
+                        if (iteration == 0) addLocalHistory(prompt, fullResponse)
+                        saveSession()
+                        running = false
+                        cb?.onCompleted(thought.ifEmpty { fullResponse })
+                    }
+                } catch (e: Exception) {
+                    if (iteration == 0) addLocalHistory(prompt, fullResponse)
+                    saveSession()
+                    running = false
+                    cb?.onCompleted(fullResponse)
+                }
+            }
+
+            override fun onError(error: String) {
+                logger.logError("Local AI Error: $error")
+                running = false
+                cb?.onError("Local AI: $error")
+            }
+        })
+        local.sendPrompt(prompt)
+    }
+
+    private fun continueLocalAI(local: LocalAIManager, originalCommand: String, r: File, iteration: Int, feedback: List<String>) {
+        if (!running) return
+        val feedbackPrompt = "## Tool Results\n${feedback.joinToString("\n")}\n\nContinue if needed. If done, return thought with summary."
+        mainHandler { cb?.onStatusChanged("Local AI 계속 작업… (${iteration + 1}/$MAX_ITER)") }
+        executeLocalAI(local, feedbackPrompt, r, iteration + 1)
     }
 
     // ── 모델 목록 조회 ─────────────────────────────────────────

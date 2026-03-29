@@ -50,6 +50,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvCurrentFile: TextView
     private lateinit var tvStatus: TextView
     private lateinit var tvCursorPos: TextView
+    private lateinit var tvLocalAIMode: TextView
     private lateinit var etAiInput: EditText
     private lateinit var btnSendAI: ImageButton
     private lateinit var btnStopAI: ImageButton
@@ -65,6 +66,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnAddApi: Button
     private lateinit var switchLocalAI: Switch
     private lateinit var btnManageLocalAI: Button
+    private lateinit var btnThinkingToggle: Button
+    private lateinit var btnOpenLog: ImageButton
 
     // ─── Managers ─────────────────────────────────
     private lateinit var logger: LogManager
@@ -81,6 +84,7 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var buildToolsReady = false
     private var logExpanded = true
+    private var thinkingEnabled = true
 
     private val apiConfigsList = mutableListOf<AIAgentManager.ApiConfig>()
 
@@ -103,16 +107,15 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 상태바 숨기기
+        // 엣지-투-엣지 레이아웃: 상태바/네비게이션바 침범 방지
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        WindowInsetsControllerCompat(window, window.decorView).apply {
-            hide(WindowInsetsCompat.Type.statusBars())
-            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
 
-        // 하단 네비게이션바 패딩 적용
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.drawerLayout)) { _, insets ->
-            val navBar = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
+            val statusBar = insets.getInsets(WindowInsetsCompat.Type.statusBars())
+            val navBar    = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
+            // 툴바에 상태바 높이만큼 상단 패딩
+            findViewById<View>(R.id.toolbar).setPadding(0, statusBar.top, 0, 0)
+            // AI 입력 패널에 내비게이션바 높이만큼 하단 패딩
             findViewById<View>(R.id.aiPanel).setPadding(0, 0, 0, navBar.bottom)
             insets
         }
@@ -159,6 +162,7 @@ class MainActivity : AppCompatActivity() {
         tvCurrentFile = findViewById(R.id.tvCurrentFile)
         tvStatus = findViewById(R.id.tvStatus)
         tvCursorPos = findViewById(R.id.tvCursorPos)
+        tvLocalAIMode = findViewById(R.id.tvLocalAIMode)
         etAiInput = findViewById(R.id.etAiInput)
         btnSendAI = findViewById(R.id.btnSendAI)
         btnStopAI = findViewById(R.id.btnStopAI)
@@ -172,6 +176,8 @@ class MainActivity : AppCompatActivity() {
         btnAddApi = findViewById(R.id.btnAddApi)
         switchLocalAI = findViewById(R.id.switchLocalAI)
         btnManageLocalAI = findViewById(R.id.btnManageLocalAI)
+        btnThinkingToggle = findViewById(R.id.btnThinkingToggle)
+        btnOpenLog = findViewById(R.id.btnOpenLog)
         btnSync = findViewById(R.id.btnSync)
         btnSwitchProject = findViewById(R.id.btnSwitchProject)
 
@@ -236,6 +242,13 @@ class MainActivity : AppCompatActivity() {
                 ActivityCompat.requestPermissions(this, needed.toTypedArray(), 100)
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 모델 관리 화면에서 돌아왔을 때 thinking 버튼 상태 갱신
+        refreshLocalAIControls()
+        updateThinkingButton()
     }
 
     override fun onPause() {
@@ -405,7 +418,14 @@ class MainActivity : AppCompatActivity() {
         projectMgr = ProjectManager(this)
         buildMgr = BuildManager(this, logger)
         aiAgent = AIAgentManager(logger)
-        localAIMgr = LocalAIManager(this, logger)
+        localAIMgr = LocalAIManager(this, logger).also { mgr ->
+            mgr.onModelReady = { modelName, backend ->
+                mainHandler.post {
+                    tvLocalAIMode.text = "Local AI: $backend"
+                    tvLocalAIMode.visibility = View.VISIBLE
+                }
+            }
+        }
         autoComplete = AutoCompleteManager(this, codeEditor)
 
         explorerAdapter = FileExplorerAdapter(
@@ -541,6 +561,13 @@ class MainActivity : AppCompatActivity() {
             localAIMgr.openManageActivity()
         }
 
+        btnThinkingToggle.setOnClickListener {
+            thinkingEnabled = !thinkingEnabled
+            localAIMgr.setThinking(thinkingEnabled)
+            updateThinkingButton()
+        }
+
+        btnOpenLog.setOnClickListener { toggleLogPanel() }
         findViewById<ImageButton>(R.id.btnToggleLog).setOnClickListener { toggleLogPanel() }
         findViewById<ImageButton>(R.id.btnClearLog).setOnClickListener { logger.clear() }
 
@@ -602,8 +629,10 @@ class MainActivity : AppCompatActivity() {
             aiAgent.setLocalAI(null, false)
             localAIMgr.stopAndDisconnect()
             switchLocalAI.setTextColor(android.graphics.Color.parseColor("#AAAAAA"))
+            tvLocalAIMode.visibility = View.GONE
             logger.logSystem("Local AI 모드 비활성화")
         }
+        refreshLocalAIControls()
     }
 
     // ─── Project Management ───────────────────────
@@ -1181,7 +1210,29 @@ class MainActivity : AppCompatActivity() {
     private fun toggleLogPanel() {
         logExpanded = !logExpanded
         logPanel.visibility = if (logExpanded) View.VISIBLE else View.GONE
+        btnOpenLog.visibility = if (logExpanded) View.GONE else View.VISIBLE
         findViewById<ImageButton>(R.id.btnToggleLog).rotation = if (logExpanded) 0f else 180f
+    }
+
+    private fun updateThinkingButton() {
+        btnThinkingToggle.text = if (thinkingEnabled) "Think: ON" else "Think: OFF"
+        btnThinkingToggle.setTextColor(
+            if (thinkingEnabled) android.graphics.Color.parseColor("#4CAF50")
+            else android.graphics.Color.parseColor("#888888")
+        )
+    }
+
+    /** 현재 선택된 로컬 모델 기반으로 thinking 버튼 표시 여부 업데이트 */
+    private fun refreshLocalAIControls() {
+        if (!switchLocalAI.isChecked) {
+            btnThinkingToggle.visibility = View.GONE
+            return
+        }
+        val modelId = com.aicode.studio.engine.ModelManager(this).activeModelId
+        val model = com.aicode.studio.engine.InferenceConfig.ALL_MODELS.firstOrNull { it.id == modelId }
+        val supports = model?.supportsThinking == true
+        btnThinkingToggle.visibility = if (supports) View.VISIBLE else View.GONE
+        if (model != null) aiAgent.setLocalModelName(model.displayName)
     }
 
     override fun onDestroy() {

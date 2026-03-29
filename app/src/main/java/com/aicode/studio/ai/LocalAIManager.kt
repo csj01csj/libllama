@@ -53,11 +53,20 @@ class LocalAIManager(private val context: Context, private val logger: LogManage
                 }
                 InferenceConfig.MSG_STATUS_REPLY -> {
                     val info = msg.data.getString("info") ?: ""
-                    if (info.startsWith("ERROR:")) {
-                        responseBuffer.clear()
-                        streamCallback?.onError(info.removePrefix("ERROR:"))
-                    } else if (info.startsWith("READY:")) {
-                        logger.logSystem("Local AI 준비됨: ${info.removePrefix("READY:")}")
+                    when {
+                        info.startsWith("ERROR:") -> {
+                            responseBuffer.clear()
+                            streamCallback?.onError(info.removePrefix("ERROR:"))
+                        }
+                        info.startsWith("READY:") -> {
+                            val parts = info.removePrefix("READY:").split("|")
+                            val modelName = parts.getOrElse(0) { "" }
+                            val backend   = parts.getOrElse(1) { "CPU" }
+                            logger.logSystem("Local AI 준비됨: $modelName ($backend)")
+                            onModelReady?.invoke(modelName, backend)
+                        }
+                        info.startsWith("MODEL_CHANGED:") ->
+                            logger.logSystem("모델 변경: ${info.removePrefix("MODEL_CHANGED:")}")
                     }
                 }
             }
@@ -111,6 +120,9 @@ class LocalAIManager(private val context: Context, private val logger: LogManage
 
     fun isConnected() = _connected && engineMessenger != null
 
+    /** 모델 로드 완료 시 (modelName, "CPU"/"GPU") 콜백 */
+    var onModelReady: ((modelName: String, backend: String) -> Unit)? = null
+
     fun setStreamCallback(cb: StreamCallback) { streamCallback = cb }
     fun clearStreamCallback() { streamCallback = null }
 
@@ -153,6 +165,16 @@ class LocalAIManager(private val context: Context, private val logger: LogManage
     fun clearHistory() {
         val msg = Message.obtain(null, InferenceConfig.MSG_CLEAR_HISTORY)
         try { engineMessenger?.send(msg) } catch (_: Exception) {}
+    }
+
+    // ── 생각(thinking) 모드 토글 ─────────────────────────────
+    fun setThinking(enabled: Boolean) {
+        val msg = Message.obtain(null, InferenceConfig.MSG_SET_THINKING).apply {
+            data = Bundle().apply { putBoolean(InferenceConfig.KEY_THINKING, enabled) }
+        }
+        try { engineMessenger?.send(msg) } catch (e: Exception) {
+            Log.e(TAG, "thinking 설정 실패", e)
+        }
     }
 
     // ── 생성 중단 ─────────────────────────────────────────────

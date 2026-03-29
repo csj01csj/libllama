@@ -10,13 +10,15 @@ add_library(llama         SHARED IMPORTED)
 add_library(ggml          SHARED IMPORTED)
 add_library(ggml_base     SHARED IMPORTED)
 add_library(ggml_cpu      SHARED IMPORTED)
+add_library(ggml_vulkan   SHARED IMPORTED)
 add_library(omp           SHARED IMPORTED)
 
-set_target_properties(llama     PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libllama.so")
-set_target_properties(ggml      PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml.so")
-set_target_properties(ggml_base PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml-base.so")
-set_target_properties(ggml_cpu  PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml-cpu.so")
-set_target_properties(omp       PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libomp.so")
+set_target_properties(llama       PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libllama.so")
+set_target_properties(ggml        PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml.so")
+set_target_properties(ggml_base   PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml-base.so")
+set_target_properties(ggml_cpu    PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml-cpu.so")
+set_target_properties(ggml_vulkan PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libggml-vulkan.so")
+set_target_properties(omp         PROPERTIES IMPORTED_LOCATION "${PREBUILT_LIB_DIR}/libomp.so")
 
 # ── Our direct JNI bridge ──────────────────────────────────────────────────────
 add_library(llama_direct SHARED llama_direct_jni.cpp)
@@ -31,6 +33,7 @@ target_link_libraries(llama_direct
     ggml
     ggml_base
     ggml_cpu
+    ggml_vulkan
     omp
     ${log-lib}
     ${android-lib})
