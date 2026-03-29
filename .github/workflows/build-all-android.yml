@@ -213,7 +213,7 @@ jobs:
             [ -n "$LLAMA_H" ] && cp "$LLAMA_H" output/ && echo "Copied llama.h from source"
           }
 
-      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2) ──────────────────
+      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.1) ────────────────
       - name: Patch ggml-vulkan.cpp for Adreno Stability
         run: |
           cat <<'EOF' > patch_aus_v2.py
@@ -222,10 +222,8 @@ jobs:
           import sys
 
           def get_function_block(content, func_name):
-              # 함수 이름으로 시작하는 위치 탐색
               match = re.search(r'\w+\s+' + func_name + r'\s*\([^)]*\)\s*\{', content)
               if not match: return None, None
-              
               start_idx = match.start()
               brace_count = 0
               end_idx = -1
@@ -248,20 +246,20 @@ jobs:
               
               with open(target, 'r') as f: content = f.read()
 
-              # 1. Define AUS Sync Helper (Robust Submission)
-              if 'void vk_aus_sync' not in content:
-                  # Detect context name precisely
-                  candidates = ['ggml_vk_context', 'ggml_vulkan_context', 'vk_context']
-                  ctx_type = None
-                  for c in candidates:
-                      if re.search(r'struct\s+' + c + r'\s*\{', content):
+              # 1. Detect Context Type (Look for the one containing cur_cb)
+              ctx_type = None
+              for c in ['ggml_vulkan_context', 'ggml_vk_context', 'vk_context']:
+                  if re.search(r'struct\s+' + c + r'\s*\{', content):
+                      s_match = re.search(r'struct\s+' + c + r'\s*\{', content)
+                      s_end = content.find('};', s_match.start())
+                      if 'cur_cb' in content[s_match.start():s_end]:
                           ctx_type = c
                           break
-                  if not ctx_type:
-                      m = re.search(r'struct\s+([a-zA-Z0-9_]*context)\s*\{', content)
-                      ctx_type = m.group(1) if m else 'ggml_vulkan_context'
+              if not ctx_type:
+                  m = re.search(r'ggml_vulkan_compute_graph\s*\(\s*(?:struct\s+)?([a-zA-Z0-9_]+)', content)
+                  ctx_type = m.group(1) if m else 'ggml_vulkan_context'
 
-                  sync_func = f"""
+              sync_func = f"""
           #include <string>
           static void vk_aus_sync({ctx_type} * ctx) {{
               if (ctx->device->name.find("Adreno") == std::string::npos) return;
@@ -275,67 +273,53 @@ jobs:
               vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);
           }}
           """
-                  # Insert after the context struct definition
-                  match = re.search(r'struct\s+' + ctx_type + r'\s*\{', content)
-                  if match:
-                      # Find matching closing brace
-                      brace_count = 0
-                      end_pos = -1
-                      for i in range(match.start(), len(content)):
-                          if content[i] == '{': brace_count += 1
-                          elif content[i] == '}':
-                              brace_count -= 1
-                              if brace_count == 0:
-                                  # Found the end, now find the semicolon
-                                  semi = content.find(';', i)
-                                  if semi != -1:
-                                      end_pos = semi + 1
-                                      break
-                      if end_pos != -1:
-                          content = content[:end_pos] + "\n" + sync_func + content[end_pos:]
-                      else:
-                          content = content.replace('#include', sync_func + '\n#include', 1)
-                  else:
-                      content = content.replace('#include', sync_func + '\n#include', 1)
 
-              # 2. Adreno Safe Mode Detection
+              # 2. Safe Insertion Point (After ctx and device struct definitions)
+              insert_pos = 0
+              for t in [ctx_type, 'vk_device_struct']:
+                  m = re.search(r'struct\s+' + t + r'\s*\{', content)
+                  if m:
+                      bc = 0
+                      for i in range(m.start(), len(content)):
+                          if content[i] == '{': bc += 1
+                          elif content[i] == '}':
+                              bc -= 1
+                              if bc == 0:
+                                  end = content.find(';', i) + 1
+                                  insert_pos = max(insert_pos, end)
+                                  break
+              if insert_pos == 0: insert_pos = content.find('#include') + 8
+              
+              if 'void vk_aus_sync' not in content:
+                  content = content[:insert_pos] + "\n" + sync_func + content[insert_pos:]
+
+              # 3. Adreno Safe Mode Detection
               content = content.replace('device->name = props.deviceName;', 
                   'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n    }')
 
-              # 3. Selective Node Splitting (Performance Optimization)
-              # Target: ggml_vk_graph_compute or ggml_vulkan_compute_graph
-              for func_name in ['ggml_vk_graph_compute', 'ggml_vulkan_compute_graph']:
-                  s, e = get_function_block(content, func_name)
+              # 4. Selective Node Splitting
+              for fn in ['ggml_vk_graph_compute', 'ggml_vulkan_compute_graph']:
+                  s, e = get_function_block(content, fn)
                   if s:
                       block = content[s:e]
-                      # 연산 노드 실행 루프 내부에 선택적 sync 삽입
-                      # MatMul, Softmax 등 무거운 연산 후에만 submit
-                      dispatch_call = 'ggml_vk_dispatch_node(ctx, node);'
-                      if dispatch_call in block:
-                          safe_dispatch = dispatch_call + """
-                  if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) {
-                      vk_aus_sync(ctx);
-                  }"""
-                          content = content[:s] + block.replace(dispatch_call, safe_dispatch) + content[e:]
+                      dc = 'ggml_vk_dispatch_node(ctx, node);'
+                      if dc in block:
+                          sd = dc + "\n        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) vk_aus_sync(ctx);"
+                          content = content[:s] + block.replace(dc, sd) + content[e:]
 
-              # 4. Softmax Internal Split (Max -> Norm)
-              # llama.cpp의 softmax 구현 함수 탐색
-              for func_name in ['ggml_vk_softmax', 'ggml_vulkan_softmax']:
-                  s, e = get_function_block(content, func_name)
+              # 5. Softmax Internal Split
+              for fn in ['ggml_vk_softmax', 'ggml_vulkan_softmax']:
+                  s, e = get_function_block(content, fn)
                   if s:
                       block = content[s:e]
-                      # 첫 번째 dispatch와 두 번째 dispatch 사이의 지점 탐색
-                      # 보통 barrier()나 pipeline 바인딩이 일어남
-                      dispatches = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
-                      if len(dispatches) >= 2:
-                          # 두 번째 dispatch 바로 직전에 sync 삽입
-                          # llama.cpp는 dispatch 전에 항상 pipeline/descriptor를 새로 바인딩함
-                          insert_pos = block.rfind('\n', 0, dispatches[1])
-                          new_block = block[:insert_pos] + '\n        vk_aus_sync(ctx);' + block[insert_pos:]
-                          content = content[:s] + new_block + content[e:]
+                      ds = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
+                      if len(ds) >= 2:
+                          ip = block.rfind('\n', 0, ds[1])
+                          nb = block[:ip] + '\n        vk_aus_sync(ctx);' + block[ip:]
+                          content = content[:s] + nb + content[e:]
 
               with open(target, 'w') as f: f.write(content)
-              print("AUS v2 Patch applied successfully")
+              print("AUS v2.1 Patch applied")
 
           if __name__ == "__main__": patch()
           EOF
