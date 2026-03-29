@@ -213,28 +213,13 @@ jobs:
             [ -n "$LLAMA_H" ] && cp "$LLAMA_H" output/ && echo "Copied llama.h from source"
           }
 
-      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.1) ────────────────
+      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.2 - Foolproof) ────
       - name: Patch ggml-vulkan.cpp for Adreno Stability
         run: |
           cat <<'EOF' > patch_aus_v2.py
           import os
           import re
           import sys
-
-          def get_function_block(content, func_name):
-              match = re.search(r'\w+\s+' + func_name + r'\s*\([^)]*\)\s*\{', content)
-              if not match: return None, None
-              start_idx = match.start()
-              brace_count = 0
-              end_idx = -1
-              for i in range(match.end() - 1, len(content)):
-                  if content[i] == '{': brace_count += 1
-                  elif content[i] == '}':
-                      brace_count -= 1
-                      if brace_count == 0:
-                          end_idx = i + 1
-                          break
-              return start_idx, end_idx
 
           def patch():
               target = None
@@ -246,23 +231,28 @@ jobs:
               
               with open(target, 'r') as f: content = f.read()
 
-              # 1. Detect Context Type (Look for the one containing cur_cb)
-              ctx_type = None
-              for c in ['ggml_vulkan_context', 'ggml_vk_context', 'vk_context']:
-                  if re.search(r'struct\s+' + c + r'\s*\{', content):
-                      s_match = re.search(r'struct\s+' + c + r'\s*\{', content)
-                      s_end = content.find('};', s_match.start())
-                      if 'cur_cb' in content[s_match.start():s_end]:
-                          ctx_type = c
-                          break
-              if not ctx_type:
-                  m = re.search(r'ggml_vulkan_compute_graph\s*\(\s*(?:struct\s+)?([a-zA-Z0-9_]+)', content)
-                  ctx_type = m.group(1) if m else 'ggml_vulkan_context'
-
+              # 1. Identify Context Type and Insertion Point from Function Signature
+              # Look for the main compute function to get the exact type name of 'ctx'
+              match = re.search(r'(?:static\s+)?void\s+(ggml_vulkan_compute_graph|ggml_vk_graph_compute)\s*\(\s*([^,)]+)\s*ctx', content)
+              if not match:
+                  print("Could not find compute function signature")
+                  sys.exit(1)
+              
+              func_name = match.group(1)
+              ctx_type_decl = match.group(2).strip() # e.g., "ggml_vulkan_context *" or "vk_context *"
+              ctx_type = ctx_type_decl.replace('*', '').strip()
+              
+              # Insertion point: right before this function
+              insert_pos = match.start()
+              
               sync_func = f"""
           #include <string>
           static void vk_aus_sync({ctx_type} * ctx) {{
-              if (ctx->device->name.find("Adreno") == std::string::npos) return;
+              if (!ctx || !ctx->device) return;
+              // Adreno check using the device name
+              std::string dname = ctx->device->name;
+              if (dname.find("Adreno") == std::string::npos) return;
+              
               vkEndCommandBuffer(ctx->cur_cb->cb);
               VkSubmitInfo si = {{ VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr }};
               vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);
@@ -273,53 +263,50 @@ jobs:
               vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);
           }}
           """
-
-              # 2. Safe Insertion Point (After ctx and device struct definitions)
-              insert_pos = 0
-              for t in [ctx_type, 'vk_device_struct']:
-                  m = re.search(r'struct\s+' + t + r'\s*\{', content)
-                  if m:
-                      bc = 0
-                      for i in range(m.start(), len(content)):
-                          if content[i] == '{': bc += 1
-                          elif content[i] == '}':
-                              bc -= 1
-                              if bc == 0:
-                                  end = content.find(';', i) + 1
-                                  insert_pos = max(insert_pos, end)
-                                  break
-              if insert_pos == 0: insert_pos = content.find('#include') + 8
-              
               if 'void vk_aus_sync' not in content:
-                  content = content[:insert_pos] + "\n" + sync_func + content[insert_pos:]
+                  content = content[:insert_pos] + "\n" + sync_func + "\n" + content[insert_pos:]
 
-              # 3. Adreno Safe Mode Detection
+              # 2. Adreno Safe Mode Detection (Existing Logic)
               content = content.replace('device->name = props.deviceName;', 
                   'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n    }')
 
-              # 4. Selective Node Splitting
-              for fn in ['ggml_vk_graph_compute', 'ggml_vulkan_compute_graph']:
-                  s, e = get_function_block(content, fn)
-                  if s:
-                      block = content[s:e]
-                      dc = 'ggml_vk_dispatch_node(ctx, node);'
-                      if dc in block:
-                          sd = dc + "\n        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) vk_aus_sync(ctx);"
-                          content = content[:s] + block.replace(dc, sd) + content[e:]
+              # 3. Selective Node Splitting (using the detected func_name)
+              # Find the node loop inside the compute function and inject sync
+              # We search for the dispatch call specifically within this function
+              def get_block(data, start):
+                  bc = 0
+                  for i in range(start, len(data)):
+                      if data[i] == '{': bc += 1
+                      elif data[i] == '}':
+                          bc -= 1
+                          if bc == 0: return i + 1
+                  return -1
 
-              # 5. Softmax Internal Split
-              for fn in ['ggml_vk_softmax', 'ggml_vulkan_softmax']:
-                  s, e = get_function_block(content, fn)
-                  if s:
-                      block = content[s:e]
+              f_start = content.find(func_name)
+              f_end = get_block(content, content.find('{', f_start))
+              if f_start != -1 and f_end != -1:
+                  block = content[f_start:f_end]
+                  dc = 'ggml_vk_dispatch_node(ctx, node);'
+                  if dc in block:
+                      sd = dc + "\n        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) vk_aus_sync(ctx);"
+                      content = content[:f_start] + block.replace(dc, sd) + content[f_end:]
+
+              # 4. Softmax Internal Split
+              sm_match = re.search(r'(ggml_vk_softmax|ggml_vulkan_softmax)', content)
+              if sm_match:
+                  s_name = sm_match.group(1)
+                  s_start = content.find(s_name)
+                  s_end = get_block(content, content.find('{', s_start))
+                  if s_start != -1 and s_end != -1:
+                      block = content[s_start:s_end]
                       ds = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
                       if len(ds) >= 2:
                           ip = block.rfind('\n', 0, ds[1])
                           nb = block[:ip] + '\n        vk_aus_sync(ctx);' + block[ip:]
-                          content = content[:s] + nb + content[e:]
+                          content = content[:s_start] + nb + content[s_end:]
 
               with open(target, 'w') as f: f.write(content)
-              print("AUS v2.1 Patch applied")
+              print("AUS v2.2 Foolproof Patch applied")
 
           if __name__ == "__main__": patch()
           EOF
