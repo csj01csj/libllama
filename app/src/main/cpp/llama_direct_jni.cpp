@@ -356,7 +356,7 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeGenerate(
      * llama_memory_seq_rm(mem, seq_id=0, p0=-1, p1=-1) removes all tokens in
      * sequence 0 (the sentinel values -1/-1 mean "entire sequence"). */
     {
-        struct llama_memory_t *mem = llama_get_memory(g_ctx);
+        llama_memory_t mem = llama_get_memory(g_ctx);
         if (mem) {
             llama_memory_seq_rm(mem, 0, -1, -1);
             LOGI("KV cache cleared for new generation");
