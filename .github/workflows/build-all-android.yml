@@ -213,7 +213,7 @@ jobs:
             [ -n "$LLAMA_H" ] && cp "$LLAMA_H" output/ && echo "Copied llama.h from source"
           }
 
-      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.3 - Deep Probe) ───
+      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.4 - Macro Mode) ──
       - name: Patch ggml-vulkan.cpp for Adreno Stability
         run: |
           cat <<'EOF' > patch_aus_v2.py
@@ -227,124 +227,70 @@ jobs:
                   if 'ggml-vulkan.cpp' in files:
                       target = os.path.join(root, 'ggml-vulkan.cpp')
                       break
-              if not target: 
-                  print("Error: ggml-vulkan.cpp not found in llama_cpp_src")
-                  sys.exit(1)
+              if not target: sys.exit(1)
               
               with open(target, 'r') as f: content = f.read()
 
-              # 1. Deep Probe: Identify the Context Type by members
-              ctx_type = None
-              # Look for a struct that has both 'cur_cb' and 'device'
-              structs = re.findall(r'struct\s+([a-zA-Z0-9_]+)\s*\{', content)
-              for s in structs:
-                  s_match = re.search(r'struct\s+' + s + r'\s*\{', content)
-                  s_end = content.find('};', s_match.start())
-                  s_body = content[s_match.start():s_end]
-                  if 'cur_cb' in s_body and 'device' in s_body:
-                      ctx_type = s
-                      print(f"Found context type: {ctx_type}")
-                      break
-              
-              if not ctx_type:
-                  # Fallback: find function taking cgraph
-                  m = re.search(r'void\s+([a-zA-Z0-9_]*graph_compute|ggml_vulkan_compute_graph|ggml_vk_graph_compute)\s*\(\s*(?:struct\s+)?([a-zA-Z0-9_]+)\s*\*\s*ctx', content)
-                  if m:
-                      ctx_type = m.group(2)
-                      print(f"Fallback context type: {ctx_type}")
-                  else:
-                      ctx_type = 'ggml_vulkan_context' # Ultimate fallback
-              
-              # 2. Find safe insertion point (after context struct definition)
-              insert_pos = 0
-              m = re.search(r'struct\s+' + ctx_type + r'\s*\{', content)
-              if m:
-                  bc = 0
-                  for i in range(m.start(), len(content)):
-                      if content[i] == '{': bc += 1
-                      elif content[i] == '}':
-                          bc -= 1
-                          if bc == 0:
-                              insert_pos = content.find(';', i) + 1
-                              break
-              
-              # Also ensure vk_device_struct is defined if we use its members
-              m_dev = re.search(r'struct\s+vk_device_struct\s*\{', content)
-              if m_dev:
-                  bc = 0
-                  for i in range(m_dev.start(), len(content)):
-                      if content[i] == '{': bc += 1
-                      elif content[i] == '}':
-                          bc -= 1
-                          if bc == 0:
-                              dev_end = content.find(';', i) + 1
-                              insert_pos = max(insert_pos, dev_end)
-                              break
-
-              if insert_pos == 0:
-                  # Last resort: after includes
-                  insert_pos = content.rfind('#include')
-                  insert_pos = content.find('\n', insert_pos) + 1
-
-              sync_func = f"""
-          #include <string>
-          static void vk_aus_sync({ctx_type} * ctx) {{
-              if (!ctx || !ctx->device) return;
-              std::string dname = ctx->device->name;
-              if (dname.find("Adreno") == std::string::npos) return;
-              
-              vkEndCommandBuffer(ctx->cur_cb->cb);
-              VkSubmitInfo si = {{ VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr }};
-              vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);
-              vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000);
-              vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence);
-              vkResetCommandBuffer(ctx->cur_cb->cb, 0);
-              VkCommandBufferBeginInfo bi = {{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr }};
-              vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);
-          }}
+              # 1. Inject Universal AUS Sync Macro (Type-agnostic)
+              # This bypasses all "unknown type name" errors
+              aus_macro = """
+          #include <string.h>
+          #define GGML_VK_AUS_SYNC(ctx) \\
+              do { \\
+                  if (ctx && ctx->device && strstr((const char*)ctx->device->name.c_str(), "Adreno")) { \\
+                      vkEndCommandBuffer(ctx->cur_cb->cb); \\
+                      VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr }; \\
+                      vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence); \\
+                      vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000); \\
+                      vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence); \\
+                      vkResetCommandBuffer(ctx->cur_cb->cb, 0); \\
+                      VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr }; \\
+                      vkBeginCommandBuffer(ctx->cur_cb->cb, &bi); \\
+                  } \\
+              } while (0)
           """
-              if 'void vk_aus_sync' not in content:
-                  content = content[:insert_pos] + "\n" + sync_func + "\n" + content[insert_pos:]
+              if '#define GGML_VK_AUS_SYNC' not in content:
+                  # Insert after the last include
+                  last_inc = content.rfind('#include')
+                  insert_pos = content.find('\n', last_inc) + 1
+                  content = content[:insert_pos] + aus_macro + content[insert_pos:]
 
-              # 3. Adreno Safe Mode Detection
+              # 2. Adreno Safe Mode Detection
               content = content.replace('device->name = props.deviceName;', 
                   'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n    }')
 
-              # 4. Selective Node Splitting
-              # Find ANY dispatch call and inject sync if it's in a loop using 'node'
+              # 3. Selective Node Splitting (using Macro)
+              # MatMul, Softmax 등 무거운 연산 후에만 동기화
               content = content.replace('ggml_vk_dispatch_node(ctx, node);', 
-                  'ggml_vk_dispatch_node(ctx, node);\n        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) vk_aus_sync(ctx);')
+                  'ggml_vk_dispatch_node(ctx, node);\n        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) GGML_VK_AUS_SYNC(ctx);')
 
-              # 5. Softmax Internal Split
-              # Use a more generic regex for dispatch in softmax
-              def patch_softmax(data):
-                  # Find softmax-like functions
-                  sm_blocks = re.findall(r'(void\s+[a-zA-Z0-9_]*softmax[^{]*\{)', data)
-                  res = data
-                  for smb in sm_blocks:
-                      start = res.find(smb)
-                      # Find matching }
-                      bc = 0
-                      end = -1
-                      for i in range(start + len(smb) - 1, len(res)):
-                          if res[i] == '{': bc += 1
-                          elif res[i] == '}':
-                              if bc == 0: end = i + 1; break
-                              bc -= 1
-                      if end != -1:
-                          block = res[start:end]
-                          dispatches = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
-                          if len(dispatches) >= 2:
-                              print(f"Patching internal split in softmax block starting at {start}")
-                              ip = block.rfind('\n', 0, dispatches[1])
-                              nb = block[:ip] + '\n        vk_aus_sync(ctx);' + block[ip:]
-                              res = res[:start] + nb + res[end:]
-                  return res
-
-              content = patch_softmax(content)
+              # 4. Softmax Internal Split (using Macro)
+              # Find all blocks that look like softmax and split their dispatches
+              sm_matches = re.findall(r'(void\s+[a-zA-Z0-9_]*softmax[^{]*\{)', content)
+              for smb in sm_matches:
+                  start = content.find(smb)
+                  bc = 0
+                  end = -1
+                  for i in range(start + len(smb) - 1, len(content)):
+                      if content[i] == '{': bc += 1
+                      elif content[i] == '}':
+                          bc -= 1
+                          if bc == 0: end = i + 1; break
+                  if end != -1:
+                      block = content[start:end]
+                      dispatches = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
+                      if len(dispatches) >= 2:
+                          # Split between first and second dispatch
+                          ip = block.rfind('\n', 0, dispatches[1])
+                          nb = block[:ip] + '\n        GGML_VK_AUS_SYNC(ctx);' + block[ip:]
+                          content = content[:start] + nb + content[end:]
 
               with open(target, 'w') as f: f.write(content)
-              print("AUS v2.3 Deep Probe Patch applied")
+              print("AUS v2.4 Macro Patch applied successfully")
+
+          if __name__ == "__main__": patch()
+          EOF
+          python3 patch_aus_v2.py
 
           if __name__ == "__main__": patch()
           EOF
