@@ -213,7 +213,7 @@ jobs:
             [ -n "$LLAMA_H" ] && cp "$LLAMA_H" output/ && echo "Copied llama.h from source"
           }
 
-      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.4 - Macro Mode) ──
+      # ── 6.1 Patch llama.cpp for Adreno Stability (AUS v2.5 - Final Fix) ──
       - name: Patch ggml-vulkan.cpp for Adreno Stability
         run: |
           cat <<'EOF' > patch_aus_v2.py
@@ -227,17 +227,18 @@ jobs:
                   if 'ggml-vulkan.cpp' in files:
                       target = os.path.join(root, 'ggml-vulkan.cpp')
                       break
-              if not target: sys.exit(1)
+              if not target: 
+                  print("Error: ggml-vulkan.cpp not found")
+                  sys.exit(1)
               
               with open(target, 'r') as f: content = f.read()
 
-              # 1. Inject Universal AUS Sync Macro (Type-agnostic)
-              # This bypasses all "unknown type name" errors
+              # 1. Inject Universal AUS Sync Macro (Defensive & Type-agnostic)
               aus_macro = """
           #include <string.h>
           #define GGML_VK_AUS_SYNC(ctx) \\
               do { \\
-                  if (ctx && ctx->device && strstr((const char*)ctx->device->name.c_str(), "Adreno")) { \\
+                  if (ctx && ctx->cur_cb && ctx->device && strstr((const char*)ctx->device->name.c_str(), "Adreno")) { \\
                       vkEndCommandBuffer(ctx->cur_cb->cb); \\
                       VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr }; \\
                       vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence); \\
@@ -250,7 +251,6 @@ jobs:
               } while (0)
           """
               if '#define GGML_VK_AUS_SYNC' not in content:
-                  # Insert after the last include
                   last_inc = content.rfind('#include')
                   insert_pos = content.find('\n', last_inc) + 1
                   content = content[:insert_pos] + aus_macro + content[insert_pos:]
@@ -259,13 +259,11 @@ jobs:
               content = content.replace('device->name = props.deviceName;', 
                   'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n    }')
 
-              # 3. Selective Node Splitting (using Macro)
-              # MatMul, Softmax 등 무거운 연산 후에만 동기화
+              # 3. Selective Node Splitting
               content = content.replace('ggml_vk_dispatch_node(ctx, node);', 
                   'ggml_vk_dispatch_node(ctx, node);\n        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_SOFT_MAX) GGML_VK_AUS_SYNC(ctx);')
 
-              # 4. Softmax Internal Split (using Macro)
-              # Find all blocks that look like softmax and split their dispatches
+              # 4. Softmax Internal Split
               sm_matches = re.findall(r'(void\s+[a-zA-Z0-9_]*softmax[^{]*\{)', content)
               for smb in sm_matches:
                   start = content.find(smb)
@@ -280,13 +278,12 @@ jobs:
                       block = content[start:end]
                       dispatches = [m.start() for m in re.finditer(r'vkCmdDispatch', block)]
                       if len(dispatches) >= 2:
-                          # Split between first and second dispatch
                           ip = block.rfind('\n', 0, dispatches[1])
                           nb = block[:ip] + '\n        GGML_VK_AUS_SYNC(ctx);' + block[ip:]
                           content = content[:start] + nb + content[end:]
 
               with open(target, 'w') as f: f.write(content)
-              print("AUS v2.4 Macro Patch applied successfully")
+              print("AUS v2.5 Final Patch applied successfully")
 
           if __name__ == "__main__": patch()
           EOF
