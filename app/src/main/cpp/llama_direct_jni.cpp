@@ -117,7 +117,7 @@ static struct llama_model* safe_load_model(const char *path,
 {
     /* CPU-only path: no need for signal protection */
     if (mparams.n_gpu_layers == 0) {
-        return llama_load_model_from_file(path, mparams);
+        return llama_model_load_from_file(path, mparams);
     }
 
     /* GPU path: install crash guard */
@@ -132,7 +132,7 @@ static struct llama_model* safe_load_model(const char *path,
     int crash_sig = sigsetjmp(g_vk_init_jmp, 1);
 
     if (crash_sig == 0) {
-        struct llama_model *model = llama_load_model_from_file(path, mparams);
+        struct llama_model *model = llama_model_load_from_file(path, mparams);
         g_in_vk_init = 0;
         sigaction(SIGSEGV, &saved_segv, nullptr);
         sigaction(SIGBUS,  &saved_bus,  nullptr);
@@ -150,7 +150,7 @@ static struct llama_model* safe_load_model(const char *path,
     setenv("GGML_VK_DISABLE", "1", 1);
     mparams.n_gpu_layers = 0;
 
-    return llama_load_model_from_file(path, mparams);
+    return llama_model_load_from_file(path, mparams);
 }
 
 /* ── JNI class/method cache ──────────────────────────────────────────────────── */
@@ -199,8 +199,8 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
     }
 
     /* Tear down any existing session */
-    if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
+    if (g_ctx)   { llama_free(g_ctx);         g_ctx   = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     g_vocab = nullptr;
 
     const char *model_path = env->GetStringUTFChars(j_model_path, nullptr);
@@ -224,15 +224,15 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
         LOGW("Model loaded CPU-only (GPU load crashed) — Vulkan disabled for this session");
     }
 
-    /* Cache vocab handle – all tokeniser/token functions take llama_vocab* in this build */
+    /* Cache vocab handle */
     g_vocab = llama_model_get_vocab(g_model);
     if (!g_vocab) {
         LOGE("llama_model_get_vocab returned null");
-        llama_free_model(g_model);
+        llama_model_free(g_model);
         g_model = nullptr;
         return -1;
     }
-    LOGI("Vocab handle: %p  n_vocab=%d", (void*)g_vocab, llama_n_vocab(g_vocab));
+    LOGI("Vocab handle: %p  n_vocab=%d", (void*)g_vocab, llama_vocab_n_tokens(g_vocab));
 
     /* ── Context params ── */
     /*
@@ -256,10 +256,10 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeInit(
     LOGI("Creating context: n_ctx=%u n_batch=%u n_ubatch=%u n_threads=%d",
          cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_threads);
 
-    g_ctx = llama_new_context_with_model(g_model, cparams);
+    g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
-        LOGE("llama_new_context_with_model failed");
-        llama_free_model(g_model);
+        LOGE("llama_init_from_model failed");
+        llama_model_free(g_model);
         g_model = nullptr;
         return -2;
     }
@@ -463,7 +463,7 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeGenerate(
         llama_token new_token = llama_sampler_sample(sampler, g_ctx, -1);
         llama_sampler_accept(sampler, new_token);
 
-        if (llama_token_is_eog(g_vocab, new_token)) {
+        if (llama_vocab_is_eog(g_vocab, new_token)) {
             stopped_by_eog = true;
             break;
         }
@@ -540,9 +540,9 @@ Java_com_aicode_studio_engine_LlamaBridgeDirect_nativeShutdown(
         JNIEnv * /*env*/, jclass /*clazz*/)
 {
     g_stop.store(true);
-    if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
+    if (g_ctx)   { llama_free(g_ctx);         g_ctx   = nullptr; }
     g_vocab = nullptr;  /* vocab is embedded in model; freed with it */
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     if (g_backend_inited) {
         llama_backend_free();
         g_backend_inited = false;
