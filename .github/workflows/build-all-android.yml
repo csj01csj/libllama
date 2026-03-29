@@ -233,38 +233,51 @@ jobs:
               with open(target, 'r') as f:
                   content = f.read()
 
-              # 1. Disable subgroup arithmetic and shuffles if Adreno
-              if 'device->name.find("Adreno") != std::string::npos' not in content:
-                  init_pattern = 'device->name = props.deviceName;'
-                  if init_pattern in content:
-                      content = content.replace(init_pattern, 
-                          'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n        fprintf(stderr, "Vulkan: Adreno AUS Mode (Ultra-Stable) Enabled\\n");\n    }')
+              # 1. Define AUS Sync Helper at the top of ggml-vulkan.cpp
+              if 'void vk_aus_sync' not in content:
+                  sync_func = (
+                      '\nstatic void vk_aus_sync(ggml_vk_context * ctx) {\n'
+                      '    if (ctx->device->name.find("Adreno") == std::string::npos) return;\n'
+                      '    vkEndCommandBuffer(ctx->cur_cb->cb);\n'
+                      '    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx->cur_cb->cb, 0, nullptr };\n'
+                      '    vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);\n'
+                      '    vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000);\n'
+                      '    vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence);\n'
+                      '    vkResetCommandBuffer(ctx->cur_cb->cb, 0);\n'
+                      '    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr };\n'
+                      '    vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);\n'
+                      '}\n'
+                  )
+                  # Insert after includes
+                  content = content.replace('#include', sync_func + '#include', 1)
 
-              # 2. Force Flash Attention off for Adreno
+              # 2. Disable subgroup arithmetic and shuffles if Adreno
+              init_pattern = 'device->name = props.deviceName;'
+              if init_pattern in content:
+                  content = content.replace(init_pattern, 
+                      'device->name = props.deviceName;\n    if (device->name.find("Adreno") != std::string::npos) {\n        device->has_subgroup_arithmetic = false;\n        device->has_subgroup_shuffle = false;\n        fprintf(stderr, "Vulkan: Adreno AUS Mode (Ultra-Stable) Enabled\\n");\n    }')
+
+              # 3. Force Flash Attention off for Adreno
               content = content.replace('ctx->pipeline_flash_attn =', 
                   'if (ctx->device->name.find("Adreno") != std::string::npos) ctx->pipeline_flash_attn = nullptr; else ctx->pipeline_flash_attn =')
 
-              # 3. Split submission for Adreno (AUS Core)
+              # 4. Patch Softmax internal split (Find the pattern: Max Kernel -> Barrier -> Norm Kernel)
+              # Standard ggml-vulkan uses multiple vkCmdDispatch for softmax.
+              # We find where it switches from max to norm and inject vk_aus_sync.
+              if 'vk_aus_sync(ctx);' not in content:
+                  # This is a heuristic but stable for llama.cpp's softmax implementation
+                  # It usually has a barrier between passes.
+                  content = content.replace('vkCmdPipelineBarrier(ctx->cur_cb->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT',
+                                          'vk_aus_sync(ctx);\n        vkCmdPipelineBarrier(ctx->cur_cb->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT')
+
+              # 5. Split submission at node level (Main loop)
               dispatch_pattern = 'ggml_vk_dispatch_node(ctx, node);'
-              aus_split = (
-                  'ggml_vk_dispatch_node(ctx, node);\n'
-                  '        if (ctx->device->name.find("Adreno") != std::string::npos) {\n'
-                  '            vkEndCommandBuffer(ctx->cur_cb->cb);\n'
-                  '            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };\n'
-                  '            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;\n'
-                  '            si.commandBufferCount = 1;\n'
-                  '            si.pCommandBuffers = &ctx->cur_cb->cb;\n'
-                  '            vkQueueSubmit(ctx->queue, 1, &si, ctx->cur_cb->fence);\n'
-                  '            vkWaitForFences(ctx->device->device, 1, &ctx->cur_cb->fence, VK_TRUE, 1000000000);\n'
-                  '            vkResetFences(ctx->device->device, 1, &ctx->cur_cb->fence);\n'
-                  '            vkResetCommandBuffer(ctx->cur_cb->cb, 0);\n'
-                  '            VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };\n'
-                  '            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;\n'
-                  '            vkBeginCommandBuffer(ctx->cur_cb->cb, &bi);\n'
-                  '        }'
-              )
-              if dispatch_pattern in content and 'vkWaitForFences' not in content[content.find(dispatch_pattern):content.find(dispatch_pattern)+300]:
-                  content = content.replace(dispatch_pattern, aus_split)
+              if dispatch_pattern in content:
+                  content = content.replace(dispatch_pattern, 'ggml_vk_dispatch_node(ctx, node);\n        vk_aus_sync(ctx);')
+
+              with open(target, 'w') as f:
+                  f.write(content)
+              print("Enhanced AUS Patch applied with Softmax internal split")
 
               with open(target, 'w') as f:
                   f.write(content)
